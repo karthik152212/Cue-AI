@@ -22,6 +22,20 @@ const DEFAULTS = {
   baseUrl: '',
   minimaxRegion: 'global_en',
   apiKeys: { openai: '', anthropic: '', gemini: '', deepgram: '', custom: '', ollama: '', groq: '', minimax: '' , azure: '' },
+  // Optional fallback keys per provider — tried in order when a configured key
+  // hits a temporary rate limit / quota. The legacy single key above is left
+  // untouched so existing configurations keep working unchanged.
+  apiKeysExtra: {
+    openai: [],
+    anthropic: [],
+    gemini: [],
+    deepgram: [],
+    custom: [],
+    ollama: [],
+    groq: [],
+    minimax: [],
+    azure: []
+  },
   azureEndpoint: '',
   // Tab 2: Profile
   resumeText: '',
@@ -91,7 +105,13 @@ module.exports = {
   setSettings(patch) {
     load();
     const nextSettings = deepMerge(data, patch || {});
-    nextSettings.baseUrl = normalizeBaseUrl(nextSettings.baseUrl);
+    try {
+      nextSettings.baseUrl = normalizeBaseUrl(nextSettings.baseUrl);
+    } catch (_) {
+      // If the user entered an invalid base URL, keep the previous one so a
+      // single bad value doesn't prevent all other settings from saving.
+      nextSettings.baseUrl = (data && data.baseUrl) || '';
+    }
     data = nextSettings;
     save();
     return data;

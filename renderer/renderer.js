@@ -6,11 +6,7 @@
   const isWindows = cue.platform === 'win32';
   const isMac = cue.platform === 'darwin';
 
-  // ---- paint icons -------------------------------------------------------
-  $('#logo-btn').innerHTML = icon('logo', { size: 18 });
-  $('.tb-hide .chev').innerHTML = icon('chevron-down', { size: 14 });
-  $('#stop-btn').innerHTML = icon('stop-square', { size: 15 });
-  $('#quit-btn').innerHTML = icon('x', { size: 14 });
+  // ---- paint cards ------------------------------------------------------
   document.querySelector('.act[data-mode="assist"] .ic').innerHTML = icon('sparkles', { size: 16 });
   document.querySelector('.act[data-mode="say"] .ic').innerHTML = icon('wand-sparkles', { size: 16 });
   document.querySelector('.act[data-mode="followup"] .ic').innerHTML = icon('message-circle', { size: 16 });
@@ -18,6 +14,13 @@
   $('#smart-toggle .ic').innerHTML = icon('zap', { size: 14 });
   $('#more-btn').innerHTML = icon('more-horizontal', { size: 18 });
   $('#send-btn').innerHTML = icon('play', { size: 15 });
+  // Drag grip + settings gear — inside the top strip that is only visible while
+  // the window is shown (Ctrl+A); the panel itself stays a drag region so the
+  // strip can move the whole (existing) window.
+  const gripEl = document.getElementById('cue-grip');
+  if (gripEl) gripEl.innerHTML = icon('grip-vertical', { size: 14 });
+  const topSettingsBtn = document.getElementById('cue-settings-btn');
+  if (topSettingsBtn) topSettingsBtn.innerHTML = icon('settings', { size: 14 });
   const clearIC = document.querySelector('#clear-transcript-btn .ic');
   if (clearIC) clearIC.innerHTML = icon('trash-2', { size: 15 });
 
@@ -29,6 +32,22 @@
   let caretEl = null;
   let responseCount = 0;
   const MAX_RESPONSES = 20;
+
+  // LLM providers that accept one-or-more API keys. The first/stored key lives in
+  // settings.apiKeys[provider]; the extras below are ordered fallbacks tried when
+  // a key is rate-limited. (Ollama is a URL and Deepgram is STT-only, so neither
+  // needs a fallback-key list.) `primaryFieldId` is the primary API-key input for
+  // that provider — the Additional-keys section is moved directly beneath it so
+  // backup keys sit next to the key they back up.
+  const EXTRA_KEY_PROVIDERS = [
+    { id: 'openai', label: 'OpenAI', primaryFieldId: 'key-openai' },
+    { id: 'anthropic', label: 'Anthropic', primaryFieldId: 'key-anthropic' },
+    { id: 'gemini', label: 'Gemini', primaryFieldId: 'key-gemini' },
+    { id: 'custom', label: 'Custom (OpenAI-compatible)', primaryFieldId: 'key-custom' },
+    { id: 'groq', label: 'Groq', primaryFieldId: 'key-groq' },
+    { id: 'minimax', label: 'MiniMax', primaryFieldId: 'key-minimax' },
+    { id: 'azure', label: 'Azure AI Foundry', primaryFieldId: 'key-azure' }
+  ];
 
   const messages = $('#messages');
 
@@ -301,7 +320,7 @@
     }
   }
 
-  // ---- Restore last question from history (Ctrl+Z) ----
+  // ---- Restore last question from history (Ctrl+Shift+Z / ⌘⇧Z) ----
   function restoreLastQuestion() {
     const last = questionHistory.pop();
     if (last) {
@@ -421,7 +440,7 @@
     
     // FIX #10: Show undo hint when explicitly cleared
     if (showUndoHint && hadContent) {
-      const undoHint = isWindows ? 'Ctrl+Z to undo' : '⌘Z to undo';
+      const undoHint = isWindows ? 'Ctrl+Shift+Z to undo' : '⌘⇧Z to undo';
       showToast(`Cleared · ${undoHint}`, 2000);
     }
   }
@@ -503,8 +522,11 @@
   }
   $('#send-btn').addEventListener('click', send);
   input.addEventListener('keydown', (e) => {
-    // Ctrl+Z / Cmd+Z: restore last question if input is empty
-    if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !input.value.trim()) {
+    // Ctrl+Shift+Z / Cmd+Shift+Z: restore last question if input is empty.
+    // Plain Ctrl+Z / Cmd+Z is cue's GLOBAL Assist shortcut (main.js), which
+    // swallows that keystroke system-wide — even while cue itself is focused —
+    // so the in-app undo lives on Shift+Z rather than fighting it.
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'z' && !input.value.trim()) {
       e.preventDefault();
       restoreLastQuestion();
       return;
@@ -515,8 +537,9 @@
       hardClearSTTFill(true); // FIX #10: Show undo hint
       return;
     }
+    // Enter sends; Shift+Enter is a newline. Assist runs from the global
+    // Cmd/Ctrl+Z shortcut or the Assist button — no in-composer combo anymore.
     if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey) { e.preventDefault(); send(); }
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); runMode('assist', ''); }
   });
   
   // FIX #13: Global keyboard shortcut for force-answer (Ctrl+Shift+A / Cmd+Shift+A)
@@ -550,26 +573,33 @@
     await cue.settingsSet({ smart: settings.smart });
   });
 
-  // Hide / collapse
-  function toggleHide() {
-    const collapsed = $('#panel').classList.toggle('collapsed');
-    $('#hide-btn').classList.toggle('collapsed', collapsed);
-    $('#live-dot').style.display = collapsed ? 'none' : '';
-  }
-  $('#hide-btn').addEventListener('click', toggleHide);
-  cue.on('hide:toggle', toggleHide);
+  // Background mode: the window is created hidden and only appears for a
+  // prepared answer. Click-outside-to-hide works through the window itself:
+  // the empty space around the answer panel is click-through
+  // (setIgnoreMouseEvents with forward:true), so clicking there lands in the
+  // application behind cue and moves focus there — this window then fires a
+  // blur that main forwards here as 'window:blur'. Clicks INSIDE the UI never
+  // blur the window, so interacting normally is unaffected, and the click
+  // still reaches the underlying app because the area stays pass-through.
+  // Deferred while a full-screen sheet (Settings / Onboarding / Consent) is
+  // open so opening an external pane mid-flow can't yank it away.
+  cue.on('window:blur', () => {
+    // Don't hide immediately after closing settings/onboarding/consent —
+    // the blur fires when the user clicks the close button or outside the
+    // scrim, and hiding the window at that point makes the UI unreachable.
+    if (Date.now() - lastSettingsClose < 500) return;
+    const sheetOpen = !!document.querySelector('#settings-scrim:not(.hidden), #onboard-scrim:not(.hidden), #consent-scrim:not(.hidden)');
+    if (!sheetOpen) cue.hideWindow();
+  });
 
-  // Stop = start/stop listening. Kick off system-audio capture straight from the click so
-  // the user-gesture is fresh for getDisplayMedia (loopback capture needs it).
-  $('#stop-btn').addEventListener('click', async () => {
-    const turningOn = !$('#stop-btn').classList.contains('active');
-    if (turningOn) {
-      // startSystemAudio may fail (user cancels, no permission) — that's OK,
-      // mic will still work and capture will toggle regardless
-      try { await startSystemAudio(); } catch (_) { /* handled inside startSystemAudio */ }
-    }
-    const active = await cue.captureToggle();
-    if (turningOn && !active) stopSystemAudio();
+  // Ctrl+A reveals the answer. The window was hidden only, so this webContents
+  // (and its buffered messages) are still alive. Re-evaluate the click-through
+  // state against the last known pointer position so that if the mouse is over
+  // an interactive Cue element (including the Settings button), the window is
+  // immediately interactive — no mouse movement required.
+  cue.on('window:reveal', () => {
+    ignoring = null;
+    setIgnore(!isOverInteractiveUI(lastPointer.x, lastPointer.y));
   });
 
   // Transcript toggle removed — sidebar now auto-opens with listening
@@ -592,7 +622,7 @@
       clearTranscriptSidebar(); // clear the history sidebar too
       hardClearSTTFill(); // clear the input box too
       
-      const undoHint = isWindows ? 'Ctrl+Z to undo' : '⌘Z to undo';
+      const undoHint = isWindows ? 'Ctrl+Shift+Z to undo' : '⌘⇧Z to undo';
       showToast(`Transcript cleared · ${undoHint}`, 3500);
     });
   }
@@ -929,7 +959,6 @@
   // ---- events from main --------------------------------------------------
   cue.on('capture:state', ({ active, streaming, mode }) => {
     setLiveDotState(active ? 'idle' : 'off');
-    $('#stop-btn').classList.toggle('active', active);
     // FIX #4: Add .listening class to composer when capture is active
     composer.classList.toggle('listening', active);
     // Update history button to show active state when listening
@@ -1040,8 +1069,6 @@
         label.textContent = localLabels[status] || status;
         label.className = 'stt-status stt-' + sttState;
       }
-      if (status === 'loading') $('#stop-btn').classList.add('active');
-      if (status === 'off' || status === 'error') $('#stop-btn').classList.remove('active');
       if (status === 'loading' || status === 'transcribing' || status === 'stopping') setLiveDotState('transcribing');
       if (status === 'ready') setLiveDotState('idle');
       if (status === 'off') setLiveDotState('off');
@@ -1222,17 +1249,33 @@
 
   // ---- settings ----------------------------------------------------------
   const scrim = $('#settings-scrim');
-  function openSettings() { fillSettings(); scrim.classList.remove('hidden'); }
-  async function closeSettings() {
-    if (await saveSettings()) scrim.classList.add('hidden');
-  }
   function openSettings() {
-    fillSettings();
+    try { fillSettings(); } catch (e) { console.error('fillSettings error:', e); }
     scrim.classList.remove('hidden');
+    // Settings is a full-screen sheet: while visible, the whole window must
+    // accept mouse input. Force a REAL state transition (reset the dedupe
+    // cache first) so `mouse:ignore false` is always sent to main, even if
+    // the pointer is already still over the sheet or the cached flag has
+    // drifted from the native window state. Mirrors consent/onboard sheets.
+    ignoring = null;
+    setIgnore(false);
     refreshWhisperModels();
   }
-  function closeSettings() { saveSettings(); scrim.classList.add('hidden'); }
+  let lastSettingsClose = 0;
+  function closeSettings() {
+    saveSettings().catch(() => {});
+    scrim.classList.add('hidden');
+    lastSettingsClose = Date.now();
+    // Sheet gone: hand control back to the normal mousemove click-through
+    // loop. Re-evaluate against the last known pointer position so a
+    // stationary mouse over the answer panel stays interactive and empty
+    // space goes click-through immediately.
+    ignoring = null;
+    setIgnore(isOverInteractiveUI(lastPointer.x, lastPointer.y));
+  }
   $('#more-btn').addEventListener('click', openSettings);
+  // Dedicated Settings button on the drag strip — reuses the existing settings UI.
+  if (topSettingsBtn) topSettingsBtn.addEventListener('click', openSettings);
   $('#s-close').addEventListener('click', () => { void closeSettings(); });
   scrim.addEventListener('click', (e) => { if (e.target === scrim) void closeSettings(); });
 
@@ -1251,6 +1294,155 @@
 
   function updateCustomProviderFields() {
     $('#custom-endpoint-settings').classList.toggle('hidden', settings.provider !== 'custom');
+  }
+
+  // ---- multi-key fallback rows (settings) --------------------------------
+  function makeExtraKeyRow(index) {
+    const row = document.createElement('div');
+    row.className = 's-extra-row';
+    const label = document.createElement('span');
+    label.textContent = 'Key ' + index;
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.className = 's-extra-key-input';
+    input.placeholder = 'API key';
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 's-extra-remove';
+    remove.title = 'Remove this fallback key';
+    remove.textContent = '✕';
+    remove.addEventListener('click', () => {
+      const group = row.closest('.s-extra-group');
+      row.remove();
+      renumberExtraRows(group);
+      ensureExtraPlaceholder(group);
+    });
+    row.append(label, input, remove);
+    return row;
+  }
+
+  function renumberExtraRows(group) {
+    Array.from(group.querySelectorAll('.s-extra-row')).forEach((r, i) => {
+      const l = r.querySelector('span');
+      if (l) l.textContent = 'Key ' + (i + 1);
+    });
+  }
+
+  function ensureExtraPlaceholder(group) {
+    const hint = Array.from(group.querySelectorAll('.s-extra-hint')).find((h) => h.textContent === 'No fallback keys.');
+    const hasRows = group.querySelectorAll('.s-extra-row').length > 0;
+    if (hasRows) {
+      if (hint) hint.remove();
+    } else if (!hint) {
+      const h = document.createElement('div');
+      h.className = 's-extra-hint';
+      h.textContent = 'No fallback keys.';
+      const btn = group.querySelector('.s-add-key');
+      group.insertBefore(h, btn);
+    }
+  }
+
+  function renderExtraKeyGroup(group, provider) {
+    group.innerHTML = '';
+    group.dataset.provider = provider;
+    const title = document.createElement('div');
+    title.className = 's-extra-group-title';
+    const meta = EXTRA_KEY_PROVIDERS.find((p) => p.id === provider);
+    title.textContent = meta ? meta.label : provider;
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 's-add-key';
+    addBtn.textContent = '+ Add API key';
+    addBtn.addEventListener('click', () => {
+      const h = Array.from(group.querySelectorAll('.s-extra-hint')).find((x) => x.textContent === 'No fallback keys.');
+      if (h) h.remove();
+      const count = group.querySelectorAll('.s-extra-row').length;
+      group.insertBefore(makeExtraKeyRow(count + 1), addBtn);
+    });
+    group.appendChild(title);
+    // addBtn must be a child of group BEFORE any insertBefore(row, addBtn) —
+    // rendering stored keys used to throw NotFoundError here, which aborted
+    // renderExtraKeyGroup and left saved backup keys invisible on reopen.
+    group.appendChild(addBtn);
+    const keys = Array.isArray(settings.apiKeysExtra && settings.apiKeysExtra[provider])
+      ? settings.apiKeysExtra[provider]
+      : [];
+    let index = 0;
+    for (const key of keys) {
+      if (!key || typeof key !== 'string' || !key.trim()) continue;
+      index++;
+      const row = makeExtraKeyRow(index);
+      row.querySelector('input').value = key;
+      group.insertBefore(row, addBtn);
+    }
+    ensureExtraPlaceholder(group);
+  }
+
+  function renderExtraKeys() {
+    const host = document.getElementById('extra-keys');
+    if (!host || !settings) return;
+
+    const provider = settings.provider;
+    const meta = EXTRA_KEY_PROVIDERS.find((p) => p.id === provider);
+    if (!meta) {
+      // Ollama / Deepgram have no extra API keys — show nothing.
+      host.innerHTML = '';
+      return;
+    }
+
+    // Rebuild from scratch on every render (provider switch, settings open) so
+    // only the SELECTED provider's group ever exists in the DOM. The other
+    // providers' stored keys live untouched in settings.apiKeysExtra and are
+    // preserved by collectExtraKeys() at save time.
+    host.innerHTML = '';
+
+    const heading = document.createElement('div');
+    heading.className = 's-extra-heading';
+    heading.textContent = 'Additional API Keys';
+    host.appendChild(heading);
+
+    const explanation = document.createElement('div');
+    explanation.className = 's-extra-explanation';
+    explanation.textContent = 'Backup keys are automatically used when the primary key is rate-limited or unavailable.';
+    host.appendChild(explanation);
+
+    const group = document.createElement('div');
+    group.className = 's-extra-group';
+    renderExtraKeyGroup(group, provider);
+    host.appendChild(group);
+
+    // Sit directly under this provider's primary API-key field so backup keys
+    // are obvious next to the key they fall back from. Falls back to the
+    // static position in index.html if the field isn't found.
+    const primaryKeyInput = meta.primaryFieldId ? document.getElementById(meta.primaryFieldId) : null;
+    if (primaryKeyInput && primaryKeyInput.parentElement) {
+      primaryKeyInput.parentElement.insertAdjacentElement('afterend', host);
+    }
+  }
+
+  function collectExtraKeys() {
+    const out = {};
+    for (const provider of EXTRA_KEY_PROVIDERS) {
+      const group = document.querySelector(`.s-extra-group[data-provider="${provider.id}"]`);
+      if (!group) {
+        // Only the selected provider's group exists in the DOM. For everyone
+        // else keep what's already saved — otherwise a Save after switching
+        // providers would silently wipe their stored backup keys.
+        out[provider.id] = Array.isArray(settings.apiKeysExtra && settings.apiKeysExtra[provider.id])
+          ? settings.apiKeysExtra[provider.id].slice()
+          : [];
+        continue;
+      }
+      const seen = [];
+      for (const input of Array.from(group.querySelectorAll('input.s-extra-key-input'))) {
+        const value = (input.value || '').trim();
+        if (value && !seen.includes(value)) seen.push(value);
+      }
+      out[provider.id] = seen;
+    }
+    return out;
   }
 
   function fillSettings() {
@@ -1272,6 +1464,7 @@
     const m = settings.models[settings.provider] || { fast: '', smart: '' };
     $('#model-fast').value = m.fast; $('#model-smart').value = m.smart;
     fillAppLinkCallers();
+    renderExtraKeys();
     $('#s-status').textContent = statusText();
     // Transcription tab
     document.querySelectorAll('#stt-provider-seg button').forEach((button) => {
@@ -1371,6 +1564,7 @@
     settings.provider = b.dataset.provider;
     document.querySelectorAll('#provider-seg button').forEach((x) => x.classList.toggle('on', x === b));
     updateCustomProviderFields();
+    renderExtraKeys();
     const m = settings.models[settings.provider] || { fast: '', smart: '' };
     $('#model-fast').value = m.fast; $('#model-smart').value = m.smart;
     $('#s-status').textContent = statusText();
@@ -1542,6 +1736,10 @@
     settings.apiKeys.minimax = $('#key-minimax').value.trim();
     settings.apiKeys.azure = $('#key-azure').value.trim();
     settings.azureEndpoint = $('#azure-endpoint').value.trim();
+    // Multi-key fallbacks: read the extra-key rows into settings.apiKeysExtra.
+    if (!settings.apiKeysExtra) settings.apiKeysExtra = {};
+    const extraKeys = collectExtraKeys();
+    for (const p of EXTRA_KEY_PROVIDERS) settings.apiKeysExtra[p.id] = extraKeys[p.id] || [];
     if (!settings.models[settings.provider]) settings.models[settings.provider] = {};
     settings.models[settings.provider].fast = $('#model-fast').value.trim();
     settings.models[settings.provider].smart = $('#model-smart').value.trim();
@@ -1593,15 +1791,158 @@
     if ((e.metaKey || e.ctrlKey) && e.key === ',') { e.preventDefault(); openSettings(); }
   });
 
-  // ---- click-through: only the UI blocks the mouse; empty gaps pass to your screen ----
+  // ---- click-through + drag + resize ----
+  // Empty areas pass clicks to the app behind cue; UI blocks capture them.
+  // During an active window drag, click-through toggling is suppressed.
   let ignoring = null;
-  function setIgnore(v) { if (v !== ignoring) { ignoring = v; cue.setIgnoreMouse(v); } }
+  let isDragging = false;
+  // Last known pointer position in client coords, kept current by the
+  // mousemove handler below so state refreshes after Settings closes can
+  // reuse it without waiting for the next mouse movement.
+  let lastPointer = { x: Math.floor(window.innerWidth / 2), y: Math.floor(window.innerHeight / 2) };
+  function setIgnore(v) {
+    if (v !== ignoring) {
+      ignoring = v;
+      cue.setIgnoreMouse(v);
+    }
+  }
+
+  // ---- Custom IPC resize ----
+  // frame: false + transparent has no OS resize borders. We detect edge
+  // proximity in mousemove (forwarded even when ignoring), then track
+  // the drag in mousedown/mousemove/mouseup and send new bounds via IPC.
+  let resizing = false;
+  let resizeEdge = '';
+  let resizeStartScreen = { x: 0, y: 0 };
+  let resizeStartBounds = { x: 0, y: 0, width: 0, height: 0 };
+  const RESIZE_BORDER = 6;
+  function getResizeEdge(cx, cy) {
+    const w = window.innerWidth, h = window.innerHeight;
+    const onTop = cy <= RESIZE_BORDER;
+    const onBot = cy >= h - RESIZE_BORDER;
+    const onLeft = cx <= RESIZE_BORDER;
+    const onRight = cx >= w - RESIZE_BORDER;
+    if (onTop && onLeft) return 'nw';
+    if (onTop && onRight) return 'ne';
+    if (onBot && onLeft) return 'sw';
+    if (onBot && onRight) return 'se';
+    if (onTop) return 'n';
+    if (onBot) return 's';
+    if (onLeft) return 'w';
+    if (onRight) return 'e';
+    return '';
+  }
+  function getResizeCursor(edge) {
+    return { n:'n-resize', s:'s-resize', e:'e-resize', w:'w-resize',
+             ne:'ne-resize', nw:'nw-resize', se:'se-resize', sw:'sw-resize' }[edge] || 'default';
+  }
+  function isOverInteractiveUI(cx, cy) {
+    const el = document.elementFromPoint(cx, cy);
+    return !!(el && el.closest && el.closest(
+      '#panel-wrap, #transcript-sidebar, #settings-scrim, #onboard-scrim, #consent-scrim, #settings'
+    ));
+  }
+
+  // mousemove: update cursor near edges, toggle click-through
   document.addEventListener('mousemove', (e) => {
-    const el = document.elementFromPoint(e.clientX, e.clientY);
-    const overUI = !!(el && el.closest && el.closest('#toolbar, #panel-wrap, #transcript-sidebar, #settings-scrim, #onboard-scrim, #consent-scrim'));
-    setIgnore(!overUI);
+    lastPointer.x = e.clientX;
+    lastPointer.y = e.clientY;
+    if (isDragging || resizing) return;
+    // While the Settings sheet is visible the entire window is interactive:
+    // never fall through to resize-edge detection or click-through, so this
+    // handler cannot flip the window back to ignore-mode mid-session.
+    if (scrim && !scrim.classList.contains('hidden')) {
+      document.body.style.cursor = '';
+      setIgnore(false);
+      return;
+    }
+    if (isOverInteractiveUI(e.clientX, e.clientY)) {
+      document.body.style.cursor = '';
+      setIgnore(false);
+    } else {
+      const edge = getResizeEdge(e.clientX, e.clientY);
+      if (edge) {
+        document.body.style.cursor = getResizeCursor(edge);
+        setIgnore(false);
+      } else {
+        document.body.style.cursor = '';
+        setIgnore(true);
+      }
+    }
   });
-  setIgnore(true); // start fully click-through; hovering the panel re-enables it
+  setIgnore(true);
+
+  // mousedown: start resize ONLY if near edge AND not over UI.
+  // If over UI, the drag-strip handler (below) takes over.
+  // Also skip if mousedown is on the drag strip (#cue-topbar) to prevent
+  // conflict with drag operations.
+  document.addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || isDragging || resizing) return;
+    if (isOverInteractiveUI(e.clientX, e.clientY)) return; // let UI handle it
+    // Prevent resize activation when clicking the drag strip (topbar)
+    if (e.target.closest('#cue-topbar')) return;
+    const edge = getResizeEdge(e.clientX, e.clientY);
+    if (!edge) return;
+    e.preventDefault();
+    resizing = true;
+    resizeEdge = edge;
+    resizeStartScreen = { x: e.screenX, y: e.screenY };
+    resizeStartBounds = {
+      x: window.screenX, y: window.screenY,
+      width: window.outerWidth, height: window.outerHeight
+    };
+    function onMove(ev) {
+      if (!resizing) return;
+      const dx = ev.screenX - resizeStartScreen.x;
+      const dy = ev.screenY - resizeStartScreen.y;
+      let { x, y, width, height } = resizeStartBounds;
+      const r = resizeEdge;
+      if (r.includes('e')) width = Math.max(380, width + dx);
+      if (r.includes('w')) { width = Math.max(380, width - dx); x = resizeStartBounds.x + (resizeStartBounds.width - width); }
+      if (r.includes('s')) height = Math.max(280, height + dy);
+      if (r.includes('n')) { height = Math.max(280, height - dy); y = resizeStartBounds.y + (resizeStartBounds.height - height); }
+      cue.setBounds({ x: Math.round(x), y: Math.round(y), width: Math.round(width), height: Math.round(height) });
+    }
+    function onUp() {
+      resizing = false;
+      resizeEdge = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  // ---- IPC-based window drag ----
+  function setupDrag(handleEl, extraCheck) {
+    if (!handleEl) return;
+    handleEl.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      if (extraCheck && extraCheck(e)) return;
+      isDragging = true;
+      cue.dragStart();
+      const offsetX = e.screenX - window.screenX;
+      const offsetY = e.screenY - window.screenY;
+      e.preventDefault();
+      function onMove(ev) {
+        if (!isDragging) return;
+        cue.moveWindow({
+          x: Math.round(ev.screenX - offsetX),
+          y: Math.round(ev.screenY - offsetY)
+        });
+      }
+      function onUp() {
+        isDragging = false;
+        cue.dragEnd();
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      }
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  }
+  // Answer window drag strip
+  setupDrag(document.getElementById('cue-topbar'), (e) => !!e.target.closest('#cue-settings-btn'));
 
   // ---- assistant access request ------------------------------------------
   // Shown here rather than as a native dialog because cue hides its dock icon:
@@ -1654,9 +1995,9 @@
         { label: 'Open Microphone settings', action: () => cue.openPane('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone') },
         { label: 'Open Screen Recording settings', action: () => cue.openPane('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture') }
       ];
-  const assistShortcut = isWindows ? '<span class="kbd">Ctrl</span> <span class="kbd">↵</span>' : '<span class="kbd">⌘</span> <span class="kbd">↵</span>';
-  const solveShortcut = isWindows ? '<span class="kbd">Ctrl</span> <span class="kbd">H</span>' : '<span class="kbd">⌘</span> <span class="kbd">H</span>';
-  const quitShortcut = isWindows ? '<span class="kbd">Ctrl</span><span class="kbd">⇧</span><span class="kbd">X</span>' : '<span class="kbd">⌘</span><span class="kbd">⇧</span><span class="kbd">X</span>';
+  const assistShortcut = isWindows ? '<span class="kbd">Ctrl</span> <span class="kbd">Z</span>' : '<span class="kbd">⌘</span> <span class="kbd">Z</span>';
+  const solveShortcut = isWindows ? '<span class="kbd">Ctrl</span> <span class="kbd">X</span>' : '<span class="kbd">⌘</span> <span class="kbd">X</span>';
+  const quitShortcut = isWindows ? '<span class="kbd">Ctrl</span><span class="kbd">⇧</span><span class="kbd">Q</span>' : '<span class="kbd">⌘</span><span class="kbd">⇧</span><span class="kbd">Q</span>';
   const OB_STEPS = [
     {
       icon: '👋',
@@ -1708,18 +2049,19 @@
   $('#ob-next').addEventListener('click', () => { if (obIndex === OB_STEPS.length - 1) finishOnboard(); else { obIndex++; renderOnboard(); } });
   $('#ob-back').addEventListener('click', () => { if (obIndex > 0) { obIndex--; renderOnboard(); } });
   $('#ob-skip').addEventListener('click', finishOnboard);
-  $('#logo-btn').addEventListener('click', showOnboard);
 
   // ---- boot --------------------------------------------------------------
   (async function boot() {
     settings = await cue.settingsGet();
     const platformInfo = await cue.platformInfo();
 
-    // R4: shortcut hints
+    // R4: shortcut hints — mirror the global shortcuts registered in main.js
+    // (Assist = Ctrl/⌘+Z · LeetCode/solve = Ctrl/⌘+X · Quit = Ctrl/⌘+Shift+Q).
+    // "What should I say?" has no global key in this design, so its hint is empty.
     const sayHintEl = document.getElementById('say-shortcut-hint');
     const assistHintEl = document.getElementById('assist-shortcut-hint');
-    if (sayHintEl) sayHintEl.textContent = isWindows ? 'Ctrl+Shift+↵' : '⌘⇧↵';
-    if (assistHintEl) assistHintEl.textContent = isWindows ? 'Ctrl+↵' : '⌘↵';
+    if (sayHintEl) sayHintEl.textContent = '';
+    if (assistHintEl) assistHintEl.textContent = isWindows ? 'Ctrl+Z' : '⌘Z';
 
     // R5: prep status
     updatePrepStatus();
@@ -1742,14 +2084,12 @@
     updateHistoryBadge(); // FIX #3: Initialize badge on boot
     updateSendButtonState(); // Initialize send button state
 
-    // Fix placeholder shortcut hint to match platform
+    // Fix placeholder shortcut hint to match platform (global Assist = Ctrl/⌘+Z)
     if (isWindows) {
-      placeholder.innerHTML = 'Ask about your screen or conversation, or <span class="keycap">Ctrl</span><span class="keycap">⏎</span> for Assist';
+      placeholder.innerHTML = 'Ask about your screen or conversation, or <span class="keycap">Ctrl</span><span class="keycap">Z</span> for Assist';
     }
 
     const st = await cue.captureState();
-    $('#live-dot').classList.toggle('off', !st.active);
-    $('#stop-btn').classList.toggle('active', st.active);
     if (!settings.onboarded) showOnboard();
   })();
 })();

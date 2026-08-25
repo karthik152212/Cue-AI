@@ -3,9 +3,16 @@ const assert = require('node:assert');
 const { DEFAULTS, resolveShortcuts, findConflicts, isValid } = require('../src/shortcuts');
 
 test('defaults cover the core actions', () => {
-  assert.strictEqual(DEFAULTS.assist, 'CommandOrControl+Return');
+  assert.strictEqual(DEFAULTS.assist, 'CommandOrControl+Z');
   assert.ok(DEFAULTS.leetcode);
   assert.ok(DEFAULTS.quit);
+  // Tightened alongside the shortcut redesign: these are the exact
+  // accelerators main.js registers.
+  assert.strictEqual(DEFAULTS.leetcode, 'CommandOrControl+X');
+  assert.strictEqual(DEFAULTS.quit, 'CommandOrControl+Shift+Q');
+  // The reveal shortcut shows the hidden answer window (Ctrl/⌘+A) without
+  // starting a new request.
+  assert.strictEqual(DEFAULTS.reveal, 'CommandOrControl+A');
 });
 
 test('resolveShortcuts merges overrides', () => {
@@ -15,7 +22,7 @@ test('resolveShortcuts merges overrides', () => {
 });
 
 test('findConflicts detects duplicate accelerators', () => {
-  const map = resolveShortcuts({ leetcode: 'CommandOrControl+Return' });
+  const map = resolveShortcuts({ leetcode: 'CommandOrControl+Z' }); // collides with the assist default
   const conflicts = findConflicts(map);
   assert.ok(conflicts.some(([a, b]) => (a === 'assist' && b === 'leetcode') || (a === 'leetcode' && b === 'assist')));
 });
@@ -25,8 +32,8 @@ test('no conflicts in the default set', () => {
 });
 
 test('isValid accepts good accelerators and rejects junk', () => {
-  assert.ok(isValid('CommandOrControl+Return'));
-  assert.ok(isValid('Shift+Q'));
+  assert.ok(isValid('CommandOrControl+Z'));
+  assert.ok(isValid('CommandOrControl+Shift+Q'));
   assert.ok(isValid('F1'));
   assert.strictEqual(isValid(''), false);
   assert.strictEqual(isValid('++'), false);

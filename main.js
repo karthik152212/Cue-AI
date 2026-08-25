@@ -31,7 +31,7 @@ let win = null;
 // false when another application already owns the combination, and nothing used
 // to look at that — so the only symptom was a key that did nothing. Iris reads
 // this and can say which key is taken instead of guessing from a screenshot.
-const shortcutState = { assist: false, say: false, leetcode: false, quit: false };
+const shortcutState = { assist: false, say: false, leetcode: false, quit: false, reveal: false };
 const isMac = process.platform === 'darwin';
 const isWindows = process.platform === 'win32';
 
@@ -187,17 +187,24 @@ function createWindow() {
   const savedSettings = store.getSettings();
   let startX = Math.round(workArea.x + (workArea.width - W) / 2);
   let startY = workArea.y + 6;
+  let startW = W;
+  let startH = H;
 
+  // Restore saved window position and dimensions
   if (savedSettings.windowX !== null && savedSettings.windowY !== null) {
     const clampedX = Math.max(workArea.x - W + 100, Math.min(savedSettings.windowX, workArea.x + workArea.width - 100));
     const clampedY = Math.max(workArea.y, Math.min(savedSettings.windowY, workArea.y + workArea.height - 40));
     startX = clampedX;
     startY = clampedY;
   }
+  if (savedSettings.windowWidth && savedSettings.windowHeight) {
+    startW = Math.max(380, Math.min(savedSettings.windowWidth, workArea.width));
+    startH = Math.max(280, Math.min(savedSettings.windowHeight, workArea.height));
+  }
 
   const winOptions = {
-    width: W,
-    height: H,
+    width: startW,
+    height: startH,
     x: startX,
     y: startY,
     frame: false,
@@ -207,6 +214,9 @@ function createWindow() {
     skipTaskbar: true,
     alwaysOnTop: true,
     fullscreenable: false,
+    show: false,
+    minWidth: 380,
+    minHeight: 280,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -245,6 +255,7 @@ function createWindow() {
 
   let moveSaveTimer = null;
   win.on('moved', () => {
+    if (dragging) return;
     clearTimeout(moveSaveTimer);
     moveSaveTimer = setTimeout(() => {
       if (win && !win.isDestroyed()) {
@@ -254,10 +265,45 @@ function createWindow() {
     }, 500);
   });
 
+  // Save window dimensions when the user resizes. Kept separate from the
+  // 'moved' handler so position and size are never mixed into a single
+  // settings write.
+  let resizeSaveTimer = null;
+  win.on('resize', () => {
+    // During drag: immediately restore size if the OS changed it.
+    // This catches asynchronous DWM adjustments that fire AFTER the
+    // synchronous verify in the window:move handler has already passed.
+    if (dragging && dragCachedW && dragCachedH) {
+      const [w, h] = win.getSize();
+      if (w !== dragCachedW || h !== dragCachedH) {
+        win.setSize(dragCachedW, dragCachedH);
+      }
+      return; // never persist drag-in-progress dimensions
+    }
+    clearTimeout(resizeSaveTimer);
+    resizeSaveTimer = setTimeout(() => {
+      if (win && !win.isDestroyed()) {
+        const [w, h] = win.getSize();
+        store.setSettings({ windowWidth: w, windowHeight: h });
+      }
+    }, 500);
+  });
+
+  // Click-outside-to-hide: cue's transparent regions are click-through
+  // (setIgnoreMouseEvents with forward:true), so a click "outside" lands in
+  // whatever application is behind cue and moves focus there — this window
+  // then fires a blur. Forward it so the renderer can ask main to hide the
+  // whole window. Clicks inside the UI keep focus on cue and never trigger this.
+  win.on('blur', () => {
+    if (win && !win.isDestroyed()) send('window:blur', {});
+  });
+
   win.setTitle('Microsoft Edge Update'); // set before load
 
+  // The window is created hidden (`show:false`) so cue is completely invisible
+  // during background operation. It only appears when the user presses Ctrl+A
+  // (Command+A) to reveal a prepared answer, then hides again on outside-click.
   win.webContents.on('did-finish-load', () => {
-    win.showInactive();
     win.setTitle('Microsoft Edge Update');
     // Warn about missing content protection on old Windows builds
     if (isWindows && shouldProtect && !WIN_SUPPORTS_CONTENT_PROTECTION) {
@@ -270,6 +316,23 @@ function createWindow() {
     console.log('[cue] renderer gone', JSON.stringify(d));
     recordEvent({ level: 'fatal', event: 'renderer_gone', code: d && d.reason, msg: 'renderer process ended: ' + JSON.stringify(d), frame: 'BrowserWindow' });
   });
+}
+
+// Reveal the hidden window to show the last prepared answer. This is the only
+// shortcut that brings the window to the foreground — Assist and LeetCode run
+// entirely in the background and never surface it. The renderer process never
+// shuts down while the window is hidden, so the finished answer is already
+// buffered in memory; showing the window (and asking the renderer to re-arm
+// its click-through state) is all that's required to display it.
+function revealAnswer() {
+  if (!win || win.isDestroyed()) return;
+  // Bring the hidden window to the foreground so the answer is actually
+  // viewable and stays in focus. On Windows `show()` already focuses, but on
+  // macOS it does not — without an explicit focus the reveal could blur and
+  // hide again immediately.
+  win.show();
+  win.focus();
+  send('window:reveal', {});
 }
 
 // -------- STT flushing (batch mode fallback) --------
@@ -628,6 +691,56 @@ ipcMain.on('system:pcm', (_e, arrayBuffer) => { if (state.capturing) routeAudio(
 ipcMain.on('mouse:ignore', (_e, v) => { if (win) win.setIgnoreMouseEvents(!!v, { forward: true }); });
 ipcMain.on('open-pane', (_e, url) => { shell.openExternal(url).catch(() => {}); });
 ipcMain.on('app:quit', () => app.quit());
+// The renderer asks us to hide the window when the user clicks outside the
+// answer panel. The window is hidden (not destroyed) so the answer and all
+// background work stay alive and can be revealed again with Ctrl+A.
+ipcMain.on('window:hide', () => { if (win && !win.isDestroyed()) win.hide(); });
+ipcMain.handle('window:getSize', () => { if (win && !win.isDestroyed()) return win.getSize(); return [700, 600]; });
+ipcMain.handle('window:setSize', (_e, w, h) => { if (win && !win.isDestroyed()) win.setSize(w, h); });
+ipcMain.on('window:setBounds', (_e, bounds) => {
+  if (!win || win.isDestroyed()) return;
+  win.setBounds(bounds, false);
+});
+ipcMain.on('window:setPosition', (_e, pos) => {
+  if (!win || win.isDestroyed()) return;
+  win.setPosition(pos.x, pos.y);
+});
+
+// --- Window drag (renderer tracks mouse, sends absolute screen position) ---
+// The renderer reads window.screenX/screenY to compute the cursor offset,
+// then sends the desired top-left corner on every mousemove.
+//
+// We use setPosition() (which only touches x/y) plus two guard layers:
+//  1. Synchronous verify after each setPosition() call
+//  2. Asynchronous guard in the 'resize' event handler (catches DWM
+//     adjustments that fire after the synchronous verify has returned)
+let dragging = false;
+let dragCachedW = 0;
+let dragCachedH = 0;
+ipcMain.on('window:drag-start', () => {
+  dragging = true;
+  if (win && !win.isDestroyed()) {
+    [dragCachedW, dragCachedH] = win.getSize();
+  }
+});
+ipcMain.on('window:move', (_e, pos) => {
+  if (!win || win.isDestroyed() || !dragging) return;
+  win.setPosition(pos.x, pos.y);
+  // Guard 1: synchronous verify — catches immediate size changes.
+  const [cw, ch] = win.getSize();
+  if (cw !== dragCachedW || ch !== dragCachedH) {
+    win.setSize(dragCachedW, dragCachedH);
+  }
+});
+ipcMain.on('window:drag-end', () => {
+  dragging = false;
+  dragCachedW = 0;
+  dragCachedH = 0;
+  if (win && !win.isDestroyed()) {
+    const [x, y] = win.getPosition();
+    store.setSettings({ windowX: x, windowY: y });
+  }
+});
 ipcMain.on('log', (_e, msg) => console.log('[renderer]', msg));
 // -------- resume / job-description file import --------
 // The dialog runs in MAIN and is filtered to pdf/docx; the renderer never supplies a path.
@@ -669,17 +782,41 @@ ipcMain.on('permissions:continue', async () => {
 
 // -------- shortcuts --------
 function registerShortcuts() {
-  shortcutState.assist = globalShortcut.register('CommandOrControl+Return', () => runFeature('assist', ''));
-  shortcutState.say = globalShortcut.register('CommandOrControl+Shift+Return', () => runFeature('say', ''));
-  shortcutState.leetcode = globalShortcut.register('CommandOrControl+H', () => runFeature('leetcode', ''));
-  shortcutState.hide = globalShortcut.register('CommandOrControl+Shift+/', () => send('hide:toggle', {}));
-  shortcutState.quit = globalShortcut.register('CommandOrControl+Shift+X', () => app.quit());
+  shortcutState.assist = globalShortcut.register(
+    'CommandOrControl+Z',
+    () => runFeature('assist', '')
+  );
+
+  shortcutState.leetcode = globalShortcut.register(
+    'CommandOrControl+X',
+    () => runFeature('leetcode', '')
+  );
+
+  shortcutState.quit = globalShortcut.register(
+    'CommandOrControl+Shift+Q',
+    () => app.quit()
+  );
+
+  // Show the latest answer without starting a new request. This is the only
+  // shortcut that makes the (otherwise invisible) window appear.
+  shortcutState.reveal = globalShortcut.register(
+    'CommandOrControl+A',
+    () => revealAnswer()
+  );
+
   for (const [name, wasRegistered] of Object.entries(shortcutState)) {
     if (!wasRegistered) {
-      recordEvent({ level: 'warn', event: 'shortcut_unavailable', msg: 'another application holds the ' + name + ' shortcut', frame: 'registerShortcuts', context: { shortcut: name } });
+      recordEvent({
+        level: 'warn',
+        event: 'shortcut_unavailable',
+        msg: 'another application holds the ' + name + ' shortcut',
+        frame: 'registerShortcuts',
+        context: { shortcut: name }
+      });
     }
   }
 }
+
 
 // -------- permissions --------
 // systemPreferences.getMediaAccessStatus('screen') is unreliable: it can return

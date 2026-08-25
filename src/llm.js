@@ -1,6 +1,7 @@
 // LLM factory — OpenAI, Anthropic, Gemini, and OpenAI-compatible APIs behind one streaming interface.
 // stream({ system, turns:[{role,text}], imageDataUrl, maxTokens, onToken }) -> Promise<fullText>
 
+const crypto = require('crypto');
 const { createCompatibleClientOptions } = require('./openai-compatible');
 
 const CUSTOM_PROVIDER = 'custom';
@@ -292,12 +293,124 @@ async function streamOllama({ apiKey, model, system, turns, imageDataUrl, maxTok
   return full;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-key rotation state.
+//
+// Tracks, in memory, which keys are currently rate-limited (temporarily cooled
+// down) or were rejected (authentication failure) for a provider. Keys are stored
+// only as short SHA-256 fingerprints so the actual secret never lives here and
+// can never end up in a log, error string, or the rotation map itself. It is not
+// persisted and resets whenever Cue restarts; a cooldown simply elapses, and the
+// state is dropped when a key stops being configured (settings change).
+// ---------------------------------------------------------------------------
+
+const KEY_COOLDOWN_MS = 60 * 1000;          // a rate-limited key rests this long
+const KEY_MAX_COOLDOWN_MS = 5 * 60 * 1000;  // provider-suggested retry delay caps here
+const keyRotationState = new Map();         // `${provider}:${fp}` -> { permanent, until }
+
+function fingerprintKey(key) {
+  return crypto.createHash('sha256').update(String(key || '').trim()).digest('hex').slice(0, 24);
+}
+
+function isKeyPermanent(provider, key) {
+  const rec = keyRotationState.get(provider + ':' + fingerprintKey(key));
+  return !!(rec && rec.permanent);
+}
+
+function isKeyAvailable(provider, key) {
+  const rec = keyRotationState.get(provider + ':' + fingerprintKey(key));
+  if (!rec) return true;
+  if (rec.permanent) return false;
+  return rec.until <= Date.now();
+}
+
+function markKeyCooldown(provider, key, error) {
+  const retrySeconds = extractRetryDelaySeconds(error && error.message);
+  const delayMs = Math.max(KEY_COOLDOWN_MS, (retrySeconds || 0) * 1000);
+  keyRotationState.set(provider + ':' + fingerprintKey(key), {
+    permanent: false,
+    until: Date.now() + Math.min(delayMs, KEY_MAX_COOLDOWN_MS)
+  });
+}
+
+function markKeyUnavailable(provider, key) {
+  // Rejected keys (401/403) stay out of rotation for the session. They are never
+  // written out and vanish from the map as soon as settings stop listing the key.
+  keyRotationState.set(provider + ':' + fingerprintKey(key), { permanent: true, until: 0 });
+}
+
+function resetKeyRotationState() {
+  keyRotationState.clear();
+}
+
+// Drop rotation entries for keys that are no longer configured, so a settings
+// change refreshes the available key pool on the very next request.
+function refreshKeyRotationState(provider, poolKeys) {
+  const prefix = provider + ':';
+  const fingerprints = new Set((poolKeys || []).map(fingerprintKey));
+  for (const entry of keyRotationState.keys()) {
+    if (entry.startsWith(prefix) && !fingerprints.has(entry.slice(prefix.length))) {
+      keyRotationState.delete(entry);
+    }
+  }
+}
+
+// Normalize the configured keys for a provider into a single ordered pool.
+// Backward compatible: a legacy `apiKeys[provider]` string is the first key, and
+// any `apiKeysExtra[provider]` entries are appended as fallbacks. Duplicate and
+// blank values are dropped.
+function getKeyPool(settings, provider) {
+  const keys = settings.apiKeys || {};
+  const extras = settings.apiKeysExtra || {};
+  const pool = [];
+  const add = (value) => {
+    if (!value || typeof value !== 'string') return;
+    const trimmed = value.trim();
+    if (!trimmed || pool.includes(trimmed)) return;
+    pool.push(trimmed);
+  };
+  add(keys[provider]);
+  const extraList = Array.isArray(extras[provider]) ? extras[provider] : [];
+  for (const value of extraList) add(value);
+  return pool;
+}
+
+// Decide the order keys are tried this request. Rate-limited keys are skipped
+// while an eligible key exists; if every configured key is currently cooled down
+// they are still tried once each (a finite number of attempts) so the user gets
+// a real provider error instead of a silent skip. If every key was previously
+// rejected, no attempt is made — hammering known-bad keys is pointless.
+function buildKeyAttempts(provider, attemptPool) {
+  if (attemptPool.length <= 1) return attemptPool;
+  if (attemptPool.every((a) => isKeyPermanent(provider, a.key))) return [];
+  const available = attemptPool.filter((a) => isKeyAvailable(provider, a.key));
+  return available.length ? available : attemptPool;
+}
+
+// The provider rejected the credential itself (as opposed to being out of quota).
+function isAuthKeyError(error) {
+  const status = error && (error.status || error.statusCode || error.response && error.response.status);
+  const code = error && (error.code || error.error && error.error.code);
+  const text = `${error && (error.message || String(error)) || ''} ${code || ''}`.toLowerCase();
+  return status === 401 || status === 403 ||
+    /invalid api key|api key not valid|invalid_api_key|authentication failed|incorrect api key|unauthorized/i.test(text);
+}
+
+// A provider-side outage (not the user's key): a 5xx, or an explicit capacity/
+// over-capacity message. Worth falling back to another configured key.
+function isTransientServerError(error) {
+  const status = error && (error.status || error.statusCode || error.response && error.response.status);
+  const text = String(error && (error.message || error) || '').toLowerCase();
+  return status === 500 || status === 502 || status === 503 || status === 504 ||
+    /server error|overloaded|temporarily unavailable|temporarily blocked|capacity|try again later/i.test(text);
+}
+
+function isRetryableKeyError(error) {
+  return isQuotaError(error) || isTransientServerError(error);
+}
+
 function createLLM(settings) {
   const provider = settings.provider;
-  const keys = settings.apiKeys || {};
-  let apiKey = keys[provider];
-  let baseURL = '';
-  let configurationError = '';
   const tier = settings.smart ? 'smart' : 'fast';
   const models = settings.models || {};
   let model = (models[provider] || {})[tier];
@@ -307,20 +420,33 @@ function createLLM(settings) {
   if (!model) model = DEFAULT_MODELS[provider] || '';
   const minimaxRegion = settings.minimaxRegion || 'global_en';
   const endpoint = settings.azureEndpoint || '';
+  let baseURL = '';
 
-  if (provider === CUSTOM_PROVIDER) {
-    try {
-      const clientOptions = createCompatibleClientOptions(apiKey, settings.baseUrl);
-      apiKey = clientOptions.apiKey;
-      baseURL = clientOptions.baseURL;
-    } catch (error) {
-      configurationError = error.message;
-    }
-    if (!model && !configurationError) {
-      configurationError = 'Set a Fast or Smart model for the Custom provider.';
-    }
-  } else if (provider !== 'ollama' && !apiKey) {
-    // Ollama is a local server: the field holds a URL, and no key is required.
+  // Multi-key pool: the legacy single `settings.apiKeys[provider]` value is the
+  // first key; `apiKeysExtra[provider]` holds optional fallback keys.
+  let poolKeys = getKeyPool(settings, provider);
+  if (provider === CUSTOM_PROVIDER && !poolKeys.length) poolKeys = ['']; // keyless local endpoint
+  if (provider === 'ollama' && !poolKeys.length) poolKeys = [((settings.apiKeys || {}).ollama) || ''];
+
+  let configurationError = '';
+  let attemptOptions = [];
+  try {
+    attemptOptions = poolKeys.map((key) => {
+      if (provider === CUSTOM_PROVIDER) {
+        const opts = createCompatibleClientOptions(key, settings.baseUrl);
+        if (!baseURL) baseURL = opts.baseURL;
+        return { key, opts: { apiKey: opts.apiKey, baseURL: opts.baseURL } };
+      }
+      return { key, opts: { apiKey: key } };
+    });
+  } catch (error) {
+    configurationError = error.message;
+  }
+
+  if (provider === CUSTOM_PROVIDER && !model && !configurationError) {
+    configurationError = 'Set a Fast or Smart model for the Custom provider.';
+  } else if (provider !== CUSTOM_PROVIDER && provider !== 'ollama' && !poolKeys.length && !configurationError) {
+    // Ollama holds a local-server URL and never needs a credential.
     configurationError = `Add your ${provider} API key in Settings.`;
   }
 
@@ -329,31 +455,94 @@ function createLLM(settings) {
     configurationError = 'Add your Azure AI Foundry endpoint in Settings.';
   }
 
+  // A settings change drops rotation state for keys that are no longer listed.
+  refreshKeyRotationState(provider, poolKeys);
+
   const ready = !configurationError && !!model;
   const maxTokens = settings.smart ? 1400 : 700;
 
   return {
-    provider, model, apiKey, baseURL,
+    provider, model,
+    baseURL,
+    // First configured key; kept for the few callers that read .apiKey directly.
+    get apiKey() { return poolKeys[0] || ''; },
+    keyCount: poolKeys.length,
     ready,
     configurationError,
     async stream(params) {
       if (!ready) throw new Error(configurationError || `Complete the ${provider} provider settings.`);
-      const args = { apiKey, baseURL, endpoint, model, maxTokens, ...params, turns: sanitizeTurns(params.turns) };
-      try {
-        if (provider === 'openai') return await streamOpenAI(args);
-        if (provider === CUSTOM_PROVIDER) return await streamOpenAI(args);
-        if (provider === 'ollama') return await streamOllama(args);
-        if (provider === 'groq') return await streamOpenAI({ ...args, baseURL: 'https://api.groq.com/openai/v1' });
-        if (provider === 'minimax') return await streamOpenAI({ ...args, baseURL: MINIMAX_BASE_URLS[minimaxRegion] || MINIMAX_BASE_URLS.global_en });
-        if (provider === 'anthropic') return await streamAnthropic(args);
-        if (provider === 'gemini') return await streamGemini(args);
-        if (provider === 'azure') return await streamAzure(args);
-        throw new Error('unknown provider: ' + provider);
-      } catch (error) {
-        throw new Error(formatProviderErrorMessage(error, provider, model));
+      const attempts = buildKeyAttempts(provider, attemptOptions);
+      if (!attempts.length) {
+        throw new Error(`${normalizeProviderName(provider)} API keys are all unavailable. Open Settings and check the configured API keys, then try again.`);
       }
+
+      // Streaming-aware fallback: a key is only skipped when it has produced no
+      // content yet. If tokens already reached the UI, switching keys mid-stream
+      // would splice together output from two unrelated request contexts, so the
+      // provider failure is surfaced instead of silently corrupting the answer.
+      const { onToken: userOnToken, ...requestParams } = params;
+      const emit = userOnToken || (() => {});
+      let lastError = null;
+      for (const attempt of attempts) {
+        let emitted = false;
+        try {
+          const args = {
+            apiKey: attempt.opts.apiKey,
+            baseURL: attempt.opts.baseURL,
+            endpoint, model, maxTokens,
+            ...requestParams,
+            turns: sanitizeTurns(requestParams.turns),
+            onToken: (t) => { if (t) emitted = true; emit(t); }
+          };
+          if (provider === 'openai') return await streamOpenAI(args);
+          if (provider === CUSTOM_PROVIDER) return await streamOpenAI(args);
+          if (provider === 'ollama') return await streamOllama(args);
+          if (provider === 'groq') return await streamOpenAI({ ...args, baseURL: 'https://api.groq.com/openai/v1' });
+          if (provider === 'minimax') return await streamOpenAI({ ...args, baseURL: MINIMAX_BASE_URLS[minimaxRegion] || MINIMAX_BASE_URLS.global_en });
+          if (provider === 'anthropic') return await streamAnthropic(args);
+          if (provider === 'gemini') return await streamGemini(args);
+          if (provider === 'azure') return await streamAzure(args);
+          throw new Error('unknown provider: ' + provider);
+        } catch (error) {
+          lastError = error;
+          if (isAuthKeyError(error)) markKeyUnavailable(provider, attempt.key);
+          if (isRetryableKeyError(error)) markKeyCooldown(provider, attempt.key, error);
+          // A key that already started streaming must not hand off to another key —
+          // joining partial text from a second context cannot produce a coherent
+          // answer. Surface the provider's failure and let the UI decide.
+          if (emitted) {
+            throw new Error(formatProviderErrorMessage(error, provider, model));
+          }
+          // This was the last configured key; there is nothing left to rotate to.
+          if (attempt === attempts[attempts.length - 1]) break;
+          // Only provider/key-specific failures (auth rejection, rate limit /
+          // quota, transient outage) justify moving to the next key. A bad model
+          // or malformed request fails identically on every key, so stop rather
+          // than spin through the rest.
+          if (!isAuthKeyError(error) && !isRetryableKeyError(error)) break;
+          continue; // finite: at most attempts.length rotations, never a loop
+        }
+      }
+      throw new Error(formatProviderErrorMessage(lastError || new Error('Unknown LLM error.'), provider, model));
     }
   };
 }
 
-module.exports = { createLLM, formatProviderErrorMessage, isQuotaError, CURRENT_GEMINI_DEFAULT };
+module.exports = {
+  createLLM,
+  formatProviderErrorMessage,
+  isQuotaError,
+  CURRENT_GEMINI_DEFAULT,
+  // Exported for unit tests and diagnostics (not part of the public API contract).
+  getKeyPool,
+  buildKeyAttempts,
+  isRetryableKeyError,
+  isAuthKeyError,
+  isTransientServerError,
+  isKeyAvailable,
+  isKeyPermanent,
+  markKeyCooldown,
+  markKeyUnavailable,
+  resetKeyRotationState,
+  refreshKeyRotationState
+};
