@@ -1271,7 +1271,7 @@
     // stationary mouse over the answer panel stays interactive and empty
     // space goes click-through immediately.
     ignoring = null;
-    setIgnore(!isOverInteractiveUI(lastPointer.x, lastPointer.y));
+    setIgnore(isOverInteractiveUI(lastPointer.x, lastPointer.y));
   }
   $('#more-btn').addEventListener('click', openSettings);
   // Dedicated Settings button on the drag strip — reuses the existing settings UI.
