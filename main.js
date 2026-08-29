@@ -77,6 +77,7 @@ let permWin = null;
 //   INTERACTIVE: focusable:true, window accepts focus for Settings/Consent.
 let regime = 'HIDDEN'; // HIDDEN | PASSIVE | INTERACTIVE
 let hookProcess = null; // child process running outside-click-hook.ps1
+let hookDismissed = false; // module-scope: prevents duplicate dismissals from stale hooks
 
 function getHookScriptPath() {
   // __dirname is always the directory containing main.js (the project root
@@ -107,9 +108,6 @@ function startOutsideClickHook() {
       ['-ExecutionPolicy', 'Bypass', '-File', scriptPath, getMainWindowHwnd()],
       { stdio: ['ignore', 'pipe', 'pipe'] }
     );
-    // Track whether the hook exited due to a normal outside-click dismissal
-    // vs. a crash.  Only auto-restart on unexpected exits.
-    let hookDismissed = false;
     hookProcess.stdout.on('data', (data) => {
       const line = data.toString().trim();
       if (line === 'outside-click') {
