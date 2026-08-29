@@ -46,6 +46,9 @@ function askInWindow(win, copy, scope) {
       clearTimeout(timer);
       ipcMain.removeListener('applink:consent-response', onResponse);
       win.removeListener('closed', onClosed);
+      // Return to passive regime after consent is answered.
+      // enterPassive is defined in main.js and attached below.
+      if (typeof global._cueEnterPassive === 'function') global._cueEnterPassive();
       resolve(allowed);
     };
     const onResponse = (_event, payload) => {
@@ -57,8 +60,10 @@ function askInWindow(win, copy, scope) {
     ipcMain.on('applink:consent-response', onResponse);
     win.once('closed', onClosed);
 
-    // cue deliberately never steals focus — except here. A question about who
-    // may read your screen activity is the one thing that should interrupt.
+    // Consent is security-critical: the window must be interactive and focused
+    // so the user can click Allow/Deny. Enter interactive regime first, then
+    // show and focus.
+    if (typeof global._cueEnterInteractive === 'function') global._cueEnterInteractive();
     if (!win.isVisible()) win.show();
     app.focus({ steal: true });
     win.focus();

@@ -48,6 +48,120 @@ const WIN_SUPPORTS_CONTENT_PROTECTION = !isWindows || WIN_BUILD >= 19041;
 
 let permWin = null;
 
+// -------- window regime (passive / interactive) --------
+// The answer window operates in two distinct regimes:
+//   PASSIVE: focusable:false, WS_EX_NOACTIVATE, non-activating overlay.
+//   INTERACTIVE: focusable:true, window accepts focus for Settings/Consent.
+let regime = 'HIDDEN'; // HIDDEN | PASSIVE | INTERACTIVE
+let hookProcess = null; // child process running outside-click-hook.ps1
+
+function getHookScriptPath() {
+  // __dirname is always the directory containing main.js (the project root
+  // in dev, or the packaged app root). app.getAppPath() can resolve to the
+  // Electron binary directory when launched via the .exe directly.
+  const scriptsDir = path.join(__dirname, 'scripts');
+  return path.join(scriptsDir, 'outside-click-hook.ps1');
+}
+
+function getMainWindowHwnd() {
+  if (!win || win.isDestroyed()) return '0';
+  const buf = win.getNativeWindowHandle();
+  return buf.readUInt32LE(0).toString();
+}
+
+function startOutsideClickHook() {
+  if (hookProcess) return;
+  if (!isWindows) return;
+  const scriptPath = getHookScriptPath();
+  const fs = require('fs');
+  if (!fs.existsSync(scriptPath)) {
+    console.log('[cue] outside-click hook script not found:', scriptPath);
+    return;
+  }
+  try {
+    hookProcess = require('child_process').spawn(
+      'powershell',
+      ['-ExecutionPolicy', 'Bypass', '-File', scriptPath, getMainWindowHwnd()],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+    // Track whether the hook exited due to a normal outside-click dismissal
+    // vs. a crash.  Only auto-restart on unexpected exits.
+    let hookDismissed = false;
+    hookProcess.stdout.on('data', (data) => {
+      const line = data.toString().trim();
+      if (line === 'outside-click') {
+        hookDismissed = true; // normal dismissal — don't restart
+        // Outside click detected: defer hide so the underlying app processes the click first
+        console.log('[cue] outside-click detected');
+        setTimeout(() => {
+          if (win && !win.isDestroyed() && regime === 'PASSIVE') {
+            win.hide();
+            enterHidden();
+            console.log('[cue] outside-click: window hidden');
+          }
+        }, 50);
+      } else if (line === 'hook-error') {
+        console.log('[cue] outside-click hook failed to install:', line);
+        hookProcess = null;
+      }
+    });
+    hookProcess.stderr.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg) console.log('[cue] hook-stderr:', msg);
+    });
+    hookProcess.on('error', (err) => {
+      console.log('[cue] outside-click hook process error:', err.message);
+      hookProcess = null;
+    });
+    hookProcess.on('exit', (code, signal) => {
+      console.log('[cue] hook exited code=' + code + ' signal=' + signal);
+      hookProcess = null;
+      // Auto-restart: if the window is still visible in PASSIVE regime and
+      // the hook didn't exit due to a normal dismissal, respawn it.
+      if (!hookDismissed && regime === 'PASSIVE' && win && !win.isDestroyed() && win.isVisible()) {
+        console.log('[cue] hook died unexpectedly — restarting');
+        setTimeout(() => startOutsideClickHook(), 200);
+      }
+    });
+  } catch (err) {
+    console.log('[cue] failed to start outside-click hook:', err.message);
+    hookProcess = null;
+  }
+}
+
+function stopOutsideClickHook() {
+  if (!hookProcess) return;
+  try { hookProcess.kill(); } catch (_) {}
+  hookProcess = null;
+}
+
+function enterPassive() {
+  if (regime === 'PASSIVE') return;
+  regime = 'PASSIVE';
+  if (win && !win.isDestroyed()) win.setFocusable(false);
+  send('window:regime', { regime: 'passive' });
+  if (win && !win.isDestroyed() && win.isVisible()) startOutsideClickHook();
+}
+
+function enterInteractive() {
+  if (regime === 'INTERACTIVE') return;
+  regime = 'INTERACTIVE';
+  stopOutsideClickHook();
+  if (win && !win.isDestroyed()) win.setFocusable(true);
+  send('window:regime', { regime: 'interactive' });
+}
+
+function enterHidden() {
+  if (regime === 'HIDDEN') return;
+  regime = 'HIDDEN';
+  stopOutsideClickHook();
+  if (win && !win.isDestroyed()) win.setFocusable(false);
+}
+
+// Expose regime functions to applink.js via global.
+global._cueEnterInteractive = enterInteractive;
+global._cueEnterPassive = enterPassive;
+
 // -------- capture / transcript state --------
 const state = { capturing: false, busy: false, transcribing: { you: false, them: false } };
 let sttDisabled = false; // set when the key can't reach any speech model (stops retry spam)
@@ -214,6 +328,7 @@ function createWindow() {
     skipTaskbar: true,
     alwaysOnTop: true,
     fullscreenable: false,
+    focusable: false,
     show: false,
     minWidth: 380,
     minHeight: 280,
@@ -289,14 +404,9 @@ function createWindow() {
     }, 500);
   });
 
-  // Click-outside-to-hide: cue's transparent regions are click-through
-  // (setIgnoreMouseEvents with forward:true), so a click "outside" lands in
-  // whatever application is behind cue and moves focus there — this window
-  // then fires a blur. Forward it so the renderer can ask main to hide the
-  // whole window. Clicks inside the UI keep focus on cue and never trigger this.
-  win.on('blur', () => {
-    if (win && !win.isDestroyed()) send('window:blur', {});
-  });
+  // Phase 3: Outside-click dismissal is handled entirely by the
+  // PowerShell WH_MOUSE_LL hook (outside-click-hook.ps1). The blur handler
+  // is no longer needed — clicks no longer pass through to the browser.
 
   win.setTitle('Microsoft Edge Update'); // set before load
 
@@ -311,6 +421,7 @@ function createWindow() {
         message: `Heads up: your Windows version (build ${WIN_BUILD}) does not support screen-share hiding. Upgrade to Windows 10 build 19041+ or Windows 11 to enable invisibility in screen shares.`
       });
     }
+
   });
   win.webContents.on('render-process-gone', (_e, d) => {
     console.log('[cue] renderer gone', JSON.stringify(d));
@@ -326,12 +437,23 @@ function createWindow() {
 // its click-through state) is all that's required to display it.
 function revealAnswer() {
   if (!win || win.isDestroyed()) return;
-  // Bring the hidden window to the foreground so the answer is actually
-  // viewable and stays in focus. On Windows `show()` already focuses, but on
-  // macOS it does not — without an explicit focus the reveal could blur and
-  // hide again immediately.
+  // Toggle: if already visible in PASSIVE regime, hide it.
+  if (win.isVisible() && regime === 'PASSIVE') {
+    win.hide();
+    enterHidden();
+    return;
+  }
+  // Show the answer window WITHOUT activating it. The window is created with
+  // focusable:false so win.show() makes it visible but the underlying app
+  // stays in the foreground (Game-Bar-style non-activating overlay).
+  // Phase 3: WS_EX_NOACTIVATE + focusable:false = non-activating overlay.
+  // Mouse events are ALWAYS delivered to Cue (no click-through).
+  enterPassive();
   win.show();
-  win.focus();
+  // Start the outside-click hook now that the window is visible.
+  // enterPassive() could not start it because win.isVisible() was false at
+  // that point (enterPassive runs before win.show).
+  if (regime === 'PASSIVE' && !hookProcess) startOutsideClickHook();
   send('window:reveal', {});
 }
 
@@ -688,13 +810,19 @@ ipcMain.handle('transcript:clear', () => {
 ipcMain.on('ask', (_e, payload) => runFeature(payload.mode, payload.text));
 ipcMain.on('mic:pcm', (_e, arrayBuffer) => { if (state.capturing) routeAudio('you', arrayBuffer); });
 ipcMain.on('system:pcm', (_e, arrayBuffer) => { if (state.capturing) routeAudio('them', arrayBuffer); });
-ipcMain.on('mouse:ignore', (_e, v) => { if (win) win.setIgnoreMouseEvents(!!v, { forward: true }); });
+// Phase 3: Click-through removed. The window always receives mouse input.
+// setIgnoreMouseEvents is no longer toggled from the renderer — the
+// window is always interactive in PASSIVE mode (non-activating via
+// WS_EX_NOACTIVATE) and only disabled in HIDDEN regime.
 ipcMain.on('open-pane', (_e, url) => { shell.openExternal(url).catch(() => {}); });
 ipcMain.on('app:quit', () => app.quit());
 // The renderer asks us to hide the window when the user clicks outside the
 // answer panel. The window is hidden (not destroyed) so the answer and all
 // background work stay alive and can be revealed again with Ctrl+A.
-ipcMain.on('window:hide', () => { if (win && !win.isDestroyed()) win.hide(); });
+ipcMain.on('window:hide', () => {
+  if (win && !win.isDestroyed()) win.hide();
+  enterHidden();
+});
 ipcMain.handle('window:getSize', () => { if (win && !win.isDestroyed()) return win.getSize(); return [700, 600]; });
 ipcMain.handle('window:setSize', (_e, w, h) => { if (win && !win.isDestroyed()) win.setSize(w, h); });
 ipcMain.on('window:setBounds', (_e, bounds) => {
@@ -741,6 +869,8 @@ ipcMain.on('window:drag-end', () => {
     store.setSettings({ windowX: x, windowY: y });
   }
 });
+ipcMain.on('window:enter-interactive', () => enterInteractive());
+ipcMain.on('window:enter-passive', () => enterPassive());
 ipcMain.on('log', (_e, msg) => console.log('[renderer]', msg));
 // -------- resume / job-description file import --------
 // The dialog runs in MAIN and is filtered to pdf/docx; the renderer never supplies a path.

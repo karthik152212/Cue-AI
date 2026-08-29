@@ -573,33 +573,16 @@
     await cue.settingsSet({ smart: settings.smart });
   });
 
-  // Background mode: the window is created hidden and only appears for a
-  // prepared answer. Click-outside-to-hide works through the window itself:
-  // the empty space around the answer panel is click-through
-  // (setIgnoreMouseEvents with forward:true), so clicking there lands in the
-  // application behind cue and moves focus there — this window then fires a
-  // blur that main forwards here as 'window:blur'. Clicks INSIDE the UI never
-  // blur the window, so interacting normally is unaffected, and the click
-  // still reaches the underlying app because the area stays pass-through.
-  // Deferred while a full-screen sheet (Settings / Onboarding / Consent) is
-  // open so opening an external pane mid-flow can't yank it away.
-  cue.on('window:blur', () => {
-    // Don't hide immediately after closing settings/onboarding/consent —
-    // the blur fires when the user clicks the close button or outside the
-    // scrim, and hiding the window at that point makes the UI unreachable.
-    if (Date.now() - lastSettingsClose < 500) return;
-    const sheetOpen = !!document.querySelector('#settings-scrim:not(.hidden), #onboard-scrim:not(.hidden), #consent-scrim:not(.hidden)');
-    if (!sheetOpen) cue.hideWindow();
-  });
+  // Outside-click dismissal is now handled by a native WH_MOUSE_LL hook
+  // in the main process (outside-click-hook.ps1). The hook detects clicks
+  // outside the window HWND and signals main to hide. The blur handler is
+  // kept as a fallback for platforms where the hook is not available.
 
   // Ctrl+A reveals the answer. The window was hidden only, so this webContents
-  // (and its buffered messages) are still alive. Re-evaluate the click-through
-  // state against the last known pointer position so that if the mouse is over
-  // an interactive Cue element (including the Settings button), the window is
-  // immediately interactive — no mouse movement required.
+  // (and its buffered messages) are still alive. Phase 3: window always receives
+  // mouse input — no click-through state to refresh.
   cue.on('window:reveal', () => {
-    ignoring = null;
-    setIgnore(!isOverInteractiveUI(lastPointer.x, lastPointer.y));
+    // No-op for mouse events — window is always mouse-interactive in passive mode.
   });
 
   // Transcript toggle removed — sidebar now auto-opens with listening
@@ -1252,13 +1235,9 @@
   function openSettings() {
     try { fillSettings(); } catch (e) { console.error('fillSettings error:', e); }
     scrim.classList.remove('hidden');
-    // Settings is a full-screen sheet: while visible, the whole window must
-    // accept mouse input. Force a REAL state transition (reset the dedupe
-    // cache first) so `mouse:ignore false` is always sent to main, even if
-    // the pointer is already still over the sheet or the cached flag has
-    // drifted from the native window state. Mirrors consent/onboard sheets.
-    ignoring = null;
-    setIgnore(false);
+    // Phase 3: Window always receives mouse input — no setIgnore needed.
+    // Enter interactive regime so the window can receive keyboard focus.
+    cue.setRegime('interactive');
     refreshWhisperModels();
   }
   let lastSettingsClose = 0;
@@ -1266,12 +1245,9 @@
     saveSettings().catch(() => {});
     scrim.classList.add('hidden');
     lastSettingsClose = Date.now();
-    // Sheet gone: hand control back to the normal mousemove click-through
-    // loop. Re-evaluate against the last known pointer position so a
-    // stationary mouse over the answer panel stays interactive and empty
-    // space goes click-through immediately.
-    ignoring = null;
-    setIgnore(!isOverInteractiveUI(lastPointer.x, lastPointer.y));
+    // Phase 3: Window always receives mouse input — no click-through refresh.
+    // Return to passive regime: focusable:false, outside-click hook active.
+    cue.setRegime('passive');
   }
   $('#more-btn').addEventListener('click', openSettings);
   // Dedicated Settings button on the drag strip — reuses the existing settings UI.
@@ -1792,25 +1768,18 @@
   });
 
   // ---- click-through + drag + resize ----
-  // Empty areas pass clicks to the app behind cue; UI blocks capture them.
-  // During an active window drag, click-through toggling is suppressed.
-  let ignoring = null;
+  // Phase 3: Click-through removed. The window always receives mouse input.
+  // WS_EX_NOACTIVATE + focusable:false keeps it non-activating.
   let isDragging = false;
   // Last known pointer position in client coords, kept current by the
   // mousemove handler below so state refreshes after Settings closes can
   // reuse it without waiting for the next mouse movement.
   let lastPointer = { x: Math.floor(window.innerWidth / 2), y: Math.floor(window.innerHeight / 2) };
-  function setIgnore(v) {
-    if (v !== ignoring) {
-      ignoring = v;
-      cue.setIgnoreMouse(v);
-    }
-  }
 
   // ---- Custom IPC resize ----
   // frame: false + transparent has no OS resize borders. We detect edge
-  // proximity in mousemove (forwarded even when ignoring), then track
-  // the drag in mousedown/mousemove/mouseup and send new bounds via IPC.
+  // proximity in mousemove, then track the drag in mousedown/mousemove/mouseup
+  // and send new bounds via IPC.
   let resizing = false;
   let resizeEdge = '';
   let resizeStartScreen = { x: 0, y: 0 };
@@ -1843,34 +1812,27 @@
     ));
   }
 
-  // mousemove: update cursor near edges, toggle click-through
+  // Phase 3: mousemove — update cursor near resize edges. Click-through removed.
   document.addEventListener('mousemove', (e) => {
     lastPointer.x = e.clientX;
     lastPointer.y = e.clientY;
     if (isDragging || resizing) return;
-    // While the Settings sheet is visible the entire window is interactive:
-    // never fall through to resize-edge detection or click-through, so this
-    // handler cannot flip the window back to ignore-mode mid-session.
+    // While the Settings sheet is visible, skip resize-edge detection.
     if (scrim && !scrim.classList.contains('hidden')) {
       document.body.style.cursor = '';
-      setIgnore(false);
       return;
     }
     if (isOverInteractiveUI(e.clientX, e.clientY)) {
       document.body.style.cursor = '';
-      setIgnore(false);
     } else {
       const edge = getResizeEdge(e.clientX, e.clientY);
       if (edge) {
         document.body.style.cursor = getResizeCursor(edge);
-        setIgnore(false);
       } else {
         document.body.style.cursor = '';
-        setIgnore(true);
       }
     }
   });
-  setIgnore(true);
 
   // mousedown: start resize ONLY if near edge AND not over UI.
   // If over UI, the drag-strip handler (below) takes over.
@@ -1945,11 +1907,8 @@
   setupDrag(document.getElementById('cue-topbar'), (e) => !!e.target.closest('#cue-settings-btn'));
 
   // ---- assistant access request ------------------------------------------
-  // Shown here rather than as a native dialog because cue hides its dock icon:
-  // an OS panel from an accessory app never comes forward and cannot be
-  // clicked. Note the scrim is registered in the click-through selector above
-  // and in styles.css — without both, this window stays transparent to the
-  // mouse and the buttons do nothing.
+  // Consent dialog — shown here because cue hides its dock icon.
+  // Phase 3: Window always receives mouse input — no click-through needed.
   const consentScrim = $('#consent-scrim');
   let pendingConsentId = null;
 
@@ -1958,6 +1917,9 @@
     cue.appLinkConsentRespond(pendingConsentId, allowed);
     pendingConsentId = null;
     consentScrim.classList.add('hidden');
+    // Return to passive regime after consent is answered.
+    // Note: applink.js also calls _cueEnterPassive as a safety net.
+    cue.setRegime('passive');
   }
 
   cue.on('applink:consent-request', (request) => {
@@ -1966,9 +1928,7 @@
     $('#cs-body').textContent = request.detail;
     $('#cs-allow').textContent = request.allowLabel;
     consentScrim.classList.remove('hidden');
-    // Do not wait for a mousemove to turn the mouse back on: the pointer may
-    // already be still, and the sheet would be unclickable until it moved.
-    setIgnore(false);
+    // Phase 3: Window always receives mouse input — no setIgnore needed.
     $('#cs-deny').focus();
   });
 
@@ -2041,10 +2001,11 @@
     $('#ob-next').textContent = obIndex === OB_STEPS.length - 1 ? 'Done' : 'Next';
     $('#ob-skip').style.visibility = obIndex === OB_STEPS.length - 1 ? 'hidden' : 'visible';
   }
-  function showOnboard() { obIndex = 0; renderOnboard(); obScrim.classList.remove('hidden'); setIgnore(false); }
+  function showOnboard() { obIndex = 0; renderOnboard(); obScrim.classList.remove('hidden'); cue.setRegime('interactive'); }
   async function finishOnboard() {
     obScrim.classList.add('hidden');
     if (settings && !settings.onboarded) { settings.onboarded = true; await cue.settingsSet({ onboarded: true }); }
+    cue.setRegime('passive');
   }
   $('#ob-next').addEventListener('click', () => { if (obIndex === OB_STEPS.length - 1) finishOnboard(); else { obIndex++; renderOnboard(); } });
   $('#ob-back').addEventListener('click', () => { if (obIndex > 0) { obIndex--; renderOnboard(); } });

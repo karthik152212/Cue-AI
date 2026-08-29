@@ -19,8 +19,9 @@ contextBridge.exposeInMainWorld('cue', {
   captureState: () => ipcRenderer.invoke('capture:state'),
   micPcm: (arrayBuffer) => ipcRenderer.send('mic:pcm', arrayBuffer),
   systemPcm: (arrayBuffer) => ipcRenderer.send('system:pcm', arrayBuffer),
-  setIgnoreMouse: (v) => ipcRenderer.send('mouse:ignore', v),
+  // Phase 3: setIgnoreMouse removed — window always receives mouse input.
   hideWindow: () => ipcRenderer.send('window:hide'),
+  setRegime: (regime) => ipcRenderer.send(regime === 'interactive' ? 'window:enter-interactive' : 'window:enter-passive'),
   getWindowSize: () => ipcRenderer.invoke('window:getSize'),
   setWindowSize: (w, h) => ipcRenderer.invoke('window:setSize', w, h),
   setBounds: (b) => ipcRenderer.send('window:setBounds', b),
@@ -40,7 +41,7 @@ contextBridge.exposeInMainWorld('cue', {
   permissionsContinue: () => ipcRenderer.send('permissions:continue'),
   log: (msg) => ipcRenderer.send('log', msg),
   on: (channel, cb) => {
-    const allowed = ['capture:state', 'llm:start', 'llm:token', 'llm:done', 'llm:error', 'status', 'transcript', 'stt:interim', 'stt:final', 'stt:status', 'vad:state', 'applink:consent-request', 'window:reveal', 'window:blur', 'whisper:download-progress', 'whisper:models-changed'];
+    const allowed = ['capture:state', 'llm:start', 'llm:token', 'llm:done', 'llm:error', 'status', 'transcript', 'stt:interim', 'stt:final', 'stt:status', 'vad:state', 'applink:consent-request', 'window:reveal', 'window:regime', 'whisper:download-progress', 'whisper:models-changed'];
     if (!allowed.includes(channel)) return;
     ipcRenderer.on(channel, (_e, data) => cb(data));
   }
