@@ -67,31 +67,19 @@ public static class HookHelper {
     static RECT s_rect;
 
     public static bool OutsideDetected;
-    public static int ClickCount;
 
     static IntPtr Callback(int nCode, IntPtr wParam, IntPtr lParam) {
         if (nCode >= 0 && wParam == (IntPtr)WM_LBUTTONDOWN && !OutsideDetected) {
-            ClickCount++;
             try {
                 var msll = (MSLL)Marshal.PtrToStructure(lParam, typeof(MSLL));
                 int x = msll.pt.X, y = msll.pt.Y;
                 bool inside = x >= s_rect.Left && x < s_rect.Right && y >= s_rect.Top && y < s_rect.Bottom;
-                string logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cue-hook-clicks.log");
-                string entry = "CLICK #" + ClickCount +
-                    " mouse=" + x + "," + y +
-                    " rect=" + s_rect.Left + "," + s_rect.Top + "," + s_rect.Right + "," + s_rect.Bottom +
-                    " => " + (inside ? "INSIDE" : "OUTSIDE");
-                System.IO.File.AppendAllText(logPath, entry + System.Environment.NewLine);
                 if (!inside) {
                     OutsideDetected = true;
-                    System.IO.File.AppendAllText(logPath, "DISMISS_EMIT" + System.Environment.NewLine);
                     PostQuitMessage(0);
-                } else {
-                    System.IO.File.AppendAllText(logPath, "NO_DISMISS" + System.Environment.NewLine);
                 }
             } catch {
-                string logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cue-hook-clicks.log");
-                System.IO.File.AppendAllText(logPath, "CLICK #" + ClickCount + " => UNKNOWN (parse error)" + System.Environment.NewLine);
+                // Parse failure: treat as UNKNOWN, never dismiss
             }
         }
         return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
@@ -99,16 +87,10 @@ public static class HookHelper {
 
     public static bool Run(IntPtr targetHwnd, RECT electronBounds) {
         OutsideDetected = false;
-        ClickCount = 0;
         s_rect = electronBounds;
         IntPtr hMod = GetModuleHandle(null);
         s_hook = SetWindowsHookEx(WH_MOUSE_LL, Callback, hMod, 0);
         if (s_hook == IntPtr.Zero) return false;
-        string logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cue-hook-clicks.log");
-        System.IO.File.AppendAllText(logPath, "READY hwnd=" + targetHwnd +
-            " rect=" + s_rect.Left + "," + s_rect.Top + "," + s_rect.Right + "," + s_rect.Bottom +
-            " width=" + (s_rect.Right - s_rect.Left) + " height=" + (s_rect.Bottom - s_rect.Top) +
-            System.Environment.NewLine);
         MSG msg;
         while (GetMessage(out msg, IntPtr.Zero, 0, 0)) {}
         if (s_hook != IntPtr.Zero) UnhookWindowsHookEx(s_hook);
