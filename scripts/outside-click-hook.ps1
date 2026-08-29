@@ -1,14 +1,37 @@
 # Outside-click hook for Cue passive answer window.
-# WH_MOUSE_LL observes mouse-down events. Classification via GetWindowRect + point-in-rect.
-# C# does marshalling + per-click diagnostic logging to stderr.
-# PowerShell writes "outside-click" to stdout after the message loop exits.
+# WH_MOUSE_LL observes mouse-down events.
+# Classification uses Electron-provided bounds (DIP→physical) instead of
+# GetWindowRect, because Chromium transparent HWNDs return compositor rects.
 #
-# Usage: powershell -ExecutionPolicy Bypass -File outside-click-hook.ps1 <hwnd>
+# Usage: powershell -ExecutionPolicy Bypass -File outside-click-hook.ps1 <hwnd> <bounds-file>
 
-param([string]$TargetHwnd)
+param(
+    [string]$TargetHwnd,
+    [string]$BoundsFile
+)
 
 $hwnd = [IntPtr]::Zero
 try { $hwnd = [IntPtr][long]$TargetHwnd } catch {}
+
+# Parse Electron bounds from temp file (avoids PowerShell interpreting negative coords as flags)
+$rectLeft = 0; $rectTop = 0; $rectRight = 0; $rectBottom = 0
+$boundsPath = Join-Path $env:TEMP $BoundsFile
+if ($BoundsFile -and (Test-Path $boundsPath)) {
+    $raw = (Get-Content $boundsPath -Raw).Trim()
+    $parts = $raw.Split(',')
+    if ($parts.Length -ge 5) {
+        $dipX = [double]$parts[0]
+        $dipY = [double]$parts[1]
+        $dipW = [double]$parts[2]
+        $dipH = [double]$parts[3]
+        $sc   = [double]$parts[4]
+        if ($sc -le 0) { $sc = 1.0 }
+        $rectLeft   = [int]([math]::Round($dipX * $sc))
+        $rectTop    = [int]([math]::Round($dipY * $sc))
+        $rectRight  = [int]([math]::Round(($dipX + $dipW) * $sc))
+        $rectBottom = [int]([math]::Round(($dipY + $dipH) * $sc))
+    }
+}
 
 Add-Type @"
 using System;
@@ -27,8 +50,6 @@ public static class HookHelper {
     static extern bool GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
     [DllImport("user32.dll")]
     static extern bool PostQuitMessage(int nExitCode);
-    [DllImport("user32.dll")]
-    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int X; public int Y; }
@@ -42,8 +63,8 @@ public static class HookHelper {
 
     const int WH_MOUSE_LL = 14;
     const int WM_LBUTTONDOWN = 0x0201;
-    static IntPtr s_hwnd;
     static IntPtr s_hook;
+    static RECT s_rect;
 
     public static bool OutsideDetected;
     public static int ClickCount;
@@ -53,49 +74,41 @@ public static class HookHelper {
             ClickCount++;
             try {
                 var msll = (MSLL)Marshal.PtrToStructure(lParam, typeof(MSLL));
-                RECT rect;
-                if (GetWindowRect(s_hwnd, out rect)) {
-                    int x = msll.pt.X, y = msll.pt.Y;
-                    bool inside = x >= rect.Left && x < rect.Right && y >= rect.Top && y < rect.Bottom;
-                    // Diagnostic: write to temp file (most reliable)
-                    string logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cue-hook-clicks.log");
-                    string entry = "CLICK #" + ClickCount +
-                        " mouse=" + x + "," + y +
-                        " rect=" + rect.Left + "," + rect.Top + "," + rect.Right + "," + rect.Bottom +
-                        " => " + (inside ? "INSIDE" : "OUTSIDE");
-                    System.IO.File.AppendAllText(logPath, entry + System.Environment.NewLine);
-                    if (!inside) {
-                        OutsideDetected = true;
-                        System.IO.File.AppendAllText(logPath, "DISMISS_EMIT" + System.Environment.NewLine);
-                        PostQuitMessage(0);
-                    } else {
-                        System.IO.File.AppendAllText(logPath, "NO_DISMISS" + System.Environment.NewLine);
-                    }
+                int x = msll.pt.X, y = msll.pt.Y;
+                bool inside = x >= s_rect.Left && x < s_rect.Right && y >= s_rect.Top && y < s_rect.Bottom;
+                string logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cue-hook-clicks.log");
+                string entry = "CLICK #" + ClickCount +
+                    " mouse=" + x + "," + y +
+                    " rect=" + s_rect.Left + "," + s_rect.Top + "," + s_rect.Right + "," + s_rect.Bottom +
+                    " => " + (inside ? "INSIDE" : "OUTSIDE");
+                System.IO.File.AppendAllText(logPath, entry + System.Environment.NewLine);
+                if (!inside) {
+                    OutsideDetected = true;
+                    System.IO.File.AppendAllText(logPath, "DISMISS_EMIT" + System.Environment.NewLine);
+                    PostQuitMessage(0);
+                } else {
+                    System.IO.File.AppendAllText(logPath, "NO_DISMISS" + System.Environment.NewLine);
                 }
             } catch {
-                Console.Error.WriteLine("CLICK #" + ClickCount + " => UNKNOWN (parse error)");
+                string logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cue-hook-clicks.log");
+                System.IO.File.AppendAllText(logPath, "CLICK #" + ClickCount + " => UNKNOWN (parse error)" + System.Environment.NewLine);
             }
         }
         return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
     }
 
-    public static bool Run(IntPtr targetHwnd) {
+    public static bool Run(IntPtr targetHwnd, RECT electronBounds) {
         OutsideDetected = false;
         ClickCount = 0;
-        s_hwnd = targetHwnd;
+        s_rect = electronBounds;
         IntPtr hMod = GetModuleHandle(null);
         s_hook = SetWindowsHookEx(WH_MOUSE_LL, Callback, hMod, 0);
-        if (s_hook == IntPtr.Zero) {
-            string logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cue-hook-clicks.log");
-        System.IO.File.AppendAllText(logPath, "HOOK_ERROR: SetWindowsHookEx failed" + System.Environment.NewLine);
-            return false;
-        }
-        RECT rect;
-        if (GetWindowRect(s_hwnd, out rect)) {
-            string logPath2 = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cue-hook-clicks.log");
-            System.IO.File.AppendAllText(logPath2, "READY hwnd=" + s_hwnd +
-                " rect=" + rect.Left + "," + rect.Top + "," + rect.Right + "," + rect.Bottom + System.Environment.NewLine);
-        }
+        if (s_hook == IntPtr.Zero) return false;
+        string logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cue-hook-clicks.log");
+        System.IO.File.AppendAllText(logPath, "READY hwnd=" + targetHwnd +
+            " rect=" + s_rect.Left + "," + s_rect.Top + "," + s_rect.Right + "," + s_rect.Bottom +
+            " width=" + (s_rect.Right - s_rect.Left) + " height=" + (s_rect.Bottom - s_rect.Top) +
+            System.Environment.NewLine);
         MSG msg;
         while (GetMessage(out msg, IntPtr.Zero, 0, 0)) {}
         if (s_hook != IntPtr.Zero) UnhookWindowsHookEx(s_hook);
@@ -104,11 +117,20 @@ public static class HookHelper {
 }
 "@
 
-# Run the hook synchronously. C# logs each click to stderr in real-time.
-# After the message loop exits (outside click or process kill), check the flag.
-$dismissed = [HookHelper]::Run($hwnd)
+# Build RECT from Electron-provided DIP bounds + scale factor
+$bounds = New-Object HookHelper+RECT
+$bounds.Left   = $rectLeft
+$bounds.Top    = $rectTop
+$bounds.Right  = $rectRight
+$bounds.Bottom = $rectBottom
 
-# Write result to stdout via Write-Host (only runs after message loop exits).
+# Run the hook synchronously
+$dismissed = [HookHelper]::Run($hwnd, $bounds)
+
+# Clean up bounds file
+if (Test-Path $boundsPath) { Remove-Item $boundsPath -Force -ErrorAction SilentlyContinue }
+
+# Write result to stdout via Write-Host (only runs after message loop exits)
 if ($dismissed) {
     Write-Host "outside-click"
 }

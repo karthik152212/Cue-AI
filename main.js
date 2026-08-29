@@ -105,9 +105,36 @@ function startOutsideClickHook() {
     return;
   }
   try {
+    // Pass the actual BrowserWindow bounds (DIP) and display scale factor
+    // so the hook can compare mouse coordinates against the real window rect.
+    // GetWindowRect() on Chromium transparent HWNDs returns the compositor
+    // surface (full display), NOT the BrowserWindow bounds.
+    let boundsArg = '';
+    try {
+      if (win && !win.isDestroyed()) {
+        const b = win.getBounds();
+        const display = screen.getDisplayMatching(b);
+        const scale = display.scaleFactor || 1;
+        boundsArg = `${b.x},${b.y},${b.width},${b.height},${scale}`;
+        // boundsArg populated for hook
+      } else {
+        console.log('[cue] hook-bounds: win unavailable');
+      }
+    } catch (_) {}
+    // Write bounds to a temp file to avoid PowerShell interpreting
+    // negative coordinates as flags (e.g. -368 parsed as - parameter).
+    let boundsFile = '';
+    if (boundsArg) {
+      try {
+        require('fs').writeFileSync(
+          require('path').join(require('os').tmpdir(), 'cue-hook-bounds.txt'),
+          boundsArg, 'utf8');
+        boundsFile = 'cue-hook-bounds.txt';
+      } catch (_) {}
+    }
     hookProcess = require('child_process').spawn(
       'powershell',
-      ['-ExecutionPolicy', 'Bypass', '-File', scriptPath, getMainWindowHwnd()],
+      ['-ExecutionPolicy', 'Bypass', '-File', scriptPath, getMainWindowHwnd(), boundsFile],
       { stdio: ['ignore', 'pipe', 'pipe'] }
     );
     hookProcess.stdout.on('data', (data) => {
