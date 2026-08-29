@@ -326,12 +326,11 @@ function createWindow() {
 // its click-through state) is all that's required to display it.
 function revealAnswer() {
   if (!win || win.isDestroyed()) return;
-  // Bring the hidden window to the foreground so the answer is actually
-  // viewable and stays in focus. On Windows `show()` already focuses, but on
-  // macOS it does not — without an explicit focus the reveal could blur and
-  // hide again immediately.
-  win.show();
-  win.focus();
+  // Show without activation: the answer window appears as a sleek overlay
+  // that does not steal focus from the current application. The user can
+  // click into Cue to activate it normally. On macOS, showInactive() also
+  // avoids the Mission-Control focus-jump that show() causes.
+  win.showInactive();
   send('window:reveal', {});
 }
 
