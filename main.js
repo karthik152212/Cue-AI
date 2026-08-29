@@ -94,7 +94,9 @@ function getMainWindowHwnd() {
 }
 
 function startOutsideClickHook() {
-  if (hookProcess) return;
+  // Always kill any stale hook first — prevents duplicate hooks and
+  // ensures a fresh hookDismissed state for the new instance.
+  stopOutsideClickHook();
   if (!isWindows) return;
   const scriptPath = getHookScriptPath();
   const fs = require('fs');
@@ -137,8 +139,10 @@ function startOutsideClickHook() {
     hookProcess.on('exit', (code, signal) => {
       console.log('[cue] hook exited code=' + code + ' signal=' + signal);
       hookProcess = null;
-      // Auto-restart: if the window is still visible in PASSIVE regime and
-      // the hook didn't exit due to a normal dismissal, respawn it.
+      // Auto-restart: if the window is still visible in PASSIVE regime
+      // and the hook exited unexpectedly (not a normal dismissal), respawn.
+      // After a normal dismissal, the hook is restarted by enterPassive()
+      // when the user re-reveals with Ctrl+A.
       if (!hookDismissed && regime === 'PASSIVE' && win && !win.isDestroyed() && win.isVisible()) {
         console.log('[cue] hook died unexpectedly — restarting');
         setTimeout(() => startOutsideClickHook(), 200);
@@ -157,10 +161,12 @@ function stopOutsideClickHook() {
 }
 
 function enterPassive() {
-  if (regime === 'PASSIVE') return;
+  const wasPassive = regime === 'PASSIVE';
   regime = 'PASSIVE';
   if (win && !win.isDestroyed()) win.setFocusable(false);
   send('window:regime', { regime: 'passive' });
+  // Always (re)start the hook — even if already PASSIVE — because the
+  // previous hook may have exited after a dismissal and not restarted.
   if (win && !win.isDestroyed() && win.isVisible()) startOutsideClickHook();
 }
 
