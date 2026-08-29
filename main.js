@@ -35,6 +35,29 @@ const shortcutState = { assist: false, say: false, leetcode: false, quit: false,
 const isMac = process.platform === 'darwin';
 const isWindows = process.platform === 'win32';
 
+// -------- Single-instance lock --------
+// Prevent two Cue processes from fighting over the same named pipe
+// (\\.\pipe\publik-com.cue.overlay-karth).  Without this, running
+// `npm start` twice (or a leftover process from a previous session)
+// causes EADDRINUSE at startup.
+//
+// NOTE: app.quit() is asynchronous — the process continues executing
+// after the call.  We must set a flag AND check it before launchApp()
+// to prevent the server from ever starting in the duplicate instance.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  // Immediately prevent all startup code from running.
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    // A second instance tried to start — bring our window to front.
+    if (win && !win.isDestroyed()) {
+      if (!win.isVisible()) win.show();
+      win.focus();
+    }
+  });
+}
+
 // -------- Windows version helpers --------
 // WDA_EXCLUDEFROMCAPTURE (setContentProtection) requires Windows 10 build 19041+.
 // os.release() returns the NT kernel version e.g. "10.0.19041" or "10.0.22000" (Win11).
@@ -1075,6 +1098,14 @@ app.whenReady().then(async () => {
   app.setName('MicrosoftEdgeUpdate');
   if (isWindows) {
     process.title = 'MicrosoftEdgeUpdate';
+  }
+
+  // If we lost the single-instance lock, quit immediately.
+  // app.quit() is asynchronous, so we must gate here to prevent
+  // launchApp() (and startAppLink()) from ever running.
+  if (!gotLock) {
+    app.quit();
+    return;
   }
 
   if (isMac) {
