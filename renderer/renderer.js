@@ -600,6 +600,7 @@
   cue.on('window:reveal', () => {
     ignoring = null;
     setIgnore(!isOverInteractiveUI(lastPointer.x, lastPointer.y));
+    syncOutsideRegion();
   });
 
   // Transcript toggle removed — sidebar now auto-opens with listening
@@ -840,6 +841,7 @@
     const panelWrap = document.getElementById('panel-wrap');
     if (panelWrap) panelWrap.classList.add('sidebar-open');
     sidebarOpen = true;
+    syncOutsideRegion();
   }
 
   function hideSidebar() {
@@ -850,6 +852,7 @@
     const panelWrap = document.getElementById('panel-wrap');
     if (panelWrap) panelWrap.classList.remove('sidebar-open');
     sidebarOpen = false;
+    syncOutsideRegion();
   }
 
   function toggleSidebar() {
@@ -1260,6 +1263,7 @@
     ignoring = null;
     setIgnore(false);
     refreshWhisperModels();
+    syncOutsideRegion();
   }
   let lastSettingsClose = 0;
   function closeSettings() {
@@ -1272,6 +1276,7 @@
     // space goes click-through immediately.
     ignoring = null;
     setIgnore(!isOverInteractiveUI(lastPointer.x, lastPointer.y));
+    syncOutsideRegion();
   }
   $('#more-btn').addEventListener('click', openSettings);
   // Dedicated Settings button on the drag strip — reuses the existing settings UI.
@@ -1807,6 +1812,39 @@
     }
   }
 
+  // ---- visible overlay region (for the outside-click observer) ----
+  // Main's mouse observer dismisses Cue when a click lands OUTSIDE the actual
+  // visible overlay. Report that region (DIP, relative to the window content
+  // area) so the observer doesn't treat clicks that merely fall inside the much
+  // larger transparent BrowserWindow as INSIDE. Window-relative coords stay
+  // correct during drag (the panel moves with the window); a resize/reveal
+  // re-syncs this. While a full-window sheet is open the whole window is
+  // interactive, so the whole window counts as INSIDE.
+  function syncOutsideRegion() {
+    if (!cue.setOutsideRegion) return;
+    const sheet = document.querySelector('#settings-scrim:not(.hidden), #onboard-scrim:not(.hidden), #consent-scrim:not(.hidden)');
+    if (sheet) {
+      cue.setOutsideRegion({ rects: [{ x: 0, y: 0, width: window.innerWidth, height: window.innerHeight }] });
+      return;
+    }
+    const parts = [document.getElementById('panel-wrap'), document.getElementById('cue-topbar')];
+    const side = document.getElementById('transcript-sidebar');
+    if (side && !side.classList.contains('hidden')) parts.push(side);
+    const rects = [];
+    for (const el of parts) {
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      rects.push({
+        x: Math.round(Math.max(0, Math.min(r.left, window.innerWidth))),
+        y: Math.round(Math.max(0, Math.min(r.top, window.innerHeight))),
+        width: Math.round(Math.min(r.right, window.innerWidth) - Math.max(0, r.left)),
+        height: Math.round(Math.min(r.bottom, window.innerHeight) - Math.max(0, r.top))
+      });
+    }
+    cue.setOutsideRegion(rects.length ? { rects } : null);
+  }
+
   // ---- Custom IPC resize ----
   // frame: false + transparent has no OS resize borders. We detect edge
   // proximity in mousemove (forwarded even when ignoring), then track
@@ -1871,6 +1909,7 @@
     }
   });
   setIgnore(true);
+  syncOutsideRegion();
 
   // mousedown: start resize ONLY if near edge AND not over UI.
   // If over UI, the drag-strip handler (below) takes over.
@@ -1906,6 +1945,7 @@
     function onUp() {
       resizing = false;
       resizeEdge = '';
+      syncOutsideRegion();
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
     }
@@ -1934,6 +1974,7 @@
       function onUp() {
         isDragging = false;
         cue.dragEnd();
+        syncOutsideRegion();
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup', onUp);
       }
@@ -1958,6 +1999,7 @@
     cue.appLinkConsentRespond(pendingConsentId, allowed);
     pendingConsentId = null;
     consentScrim.classList.add('hidden');
+    syncOutsideRegion();
   }
 
   cue.on('applink:consent-request', (request) => {
@@ -1966,6 +2008,7 @@
     $('#cs-body').textContent = request.detail;
     $('#cs-allow').textContent = request.allowLabel;
     consentScrim.classList.remove('hidden');
+    syncOutsideRegion();
     // Do not wait for a mousemove to turn the mouse back on: the pointer may
     // already be still, and the sheet would be unclickable until it moved.
     setIgnore(false);
@@ -2041,9 +2084,10 @@
     $('#ob-next').textContent = obIndex === OB_STEPS.length - 1 ? 'Done' : 'Next';
     $('#ob-skip').style.visibility = obIndex === OB_STEPS.length - 1 ? 'hidden' : 'visible';
   }
-  function showOnboard() { obIndex = 0; renderOnboard(); obScrim.classList.remove('hidden'); setIgnore(false); }
+  function showOnboard() { obIndex = 0; renderOnboard(); obScrim.classList.remove('hidden'); setIgnore(false); syncOutsideRegion(); }
   async function finishOnboard() {
     obScrim.classList.add('hidden');
+    syncOutsideRegion();
     if (settings && !settings.onboarded) { settings.onboarded = true; await cue.settingsSet({ onboarded: true }); }
   }
   $('#ob-next').addEventListener('click', () => { if (obIndex === OB_STEPS.length - 1) finishOnboard(); else { obIndex++; renderOnboard(); } });

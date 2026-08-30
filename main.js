@@ -35,6 +35,19 @@ const shortcutState = { assist: false, say: false, leetcode: false, quit: false,
 const isMac = process.platform === 'darwin';
 const isWindows = process.platform === 'win32';
 
+// Mouse observer: detects outside clicks when Cue is visible but unfocused.
+// Uses GetAsyncKeyState polling — no hooks, no PowerShell, no cursor manipulation.
+let mouseObserver = null;
+if (isWindows) {
+  try { mouseObserver = require('./src/mouse-observer'); } catch (e) { console.log('[cue] mouse-observer unavailable:', e.message); }
+}
+// Actual visible Cue overlay region (DIP, relative to the window's content
+// area), reported by the renderer. The mouse observer compares clicks against
+// THIS region instead of the whole transparent BrowserWindow — which is often
+// much larger than the visible answer panel — so a click that merely lands
+// inside the big HWND (but outside the visible overlay) dismisses Cue.
+let outsideRegion = null;
+
 // -------- Windows version helpers --------
 // WDA_EXCLUDEFROMCAPTURE (setContentProtection) requires Windows 10 build 19041+.
 // os.release() returns the NT kernel version e.g. "10.0.19041" or "10.0.22000" (Win11).
@@ -297,6 +310,13 @@ function createWindow() {
   win.on('blur', () => {
     if (win && !win.isDestroyed()) send('window:blur', {});
   });
+  // When Cue gains focus (user clicked inside), stop the mouse observer.
+  // The existing blur handler will handle subsequent outside clicks.
+  win.on('focus', () => {
+    if (mouseObserver && mouseObserver.isRunning()) {
+      mouseObserver.stop();
+    }
+  });
 
   win.setTitle('Microsoft Edge Update'); // set before load
 
@@ -332,6 +352,46 @@ function revealAnswer() {
   // avoids the Mission-Control focus-jump that show() causes.
   win.showInactive();
   send('window:reveal', {});
+  // Start mouse observer so outside clicks dismiss Cue even before it gains focus.
+  // Once Cue is focused, the existing blur handler takes over and we stop the observer.
+  if (isWindows && mouseObserver) {
+    if (!mouseObserver.isRunning()) {
+      mouseObserver.start(
+        () => {
+          if (!win || win.isDestroyed()) return null;
+          const b = win.getBounds();
+          const d = screen.getDisplayMatching(b);
+          const scale = d.scaleFactor || 1;
+          // INSIDE/OUTSIDE boundary = the ACTUAL visible overlay blocks reported
+          // by the renderer (physical rects); otherwise fall back to the HWND.
+          if (outsideRegion && outsideRegion.rects && outsideRegion.rects.length) {
+            const rects = [];
+            for (const rr of outsideRegion.rects) {
+              const l = Math.max(b.x, b.x + rr.x) * scale;
+              const t = Math.max(b.y, b.y + rr.y) * scale;
+              const ri = Math.min(b.x + b.width, b.x + rr.x + rr.width) * scale;
+              const bo = Math.min(b.y + b.height, b.y + rr.y + rr.height) * scale;
+              if (ri > l && bo > t) rects.push({ left: Math.round(l), top: Math.round(t), right: Math.round(ri), bottom: Math.round(bo) });
+            }
+            if (rects.length) return { rects };
+          }
+          return { x: b.x, y: b.y, width: b.width, height: b.height, scale };
+        },
+        () => {
+          // Outside click: dismiss exactly once, and stop the observer so the
+          // next reveal re-arms it fresh (the `fired` latch must not survive
+          // into the next show/reveal cycle).
+          if (mouseObserver) mouseObserver.stop();
+          if (win && !win.isDestroyed()) win.hide();
+        }
+      );
+    } else {
+      // Observer is still running from a previous reveal/hide cycle; re-arm it
+      // so the very next click is classified again instead of being swallowed
+      // by the stale `fired` latch.
+      mouseObserver.rearm();
+    }
+  }
 }
 
 // -------- STT flushing (batch mode fallback) --------
@@ -693,7 +753,21 @@ ipcMain.on('app:quit', () => app.quit());
 // The renderer asks us to hide the window when the user clicks outside the
 // answer panel. The window is hidden (not destroyed) so the answer and all
 // background work stay alive and can be revealed again with Ctrl+A.
-ipcMain.on('window:hide', () => { if (win && !win.isDestroyed()) win.hide(); });
+ipcMain.on('window:hide', () => {
+  if (mouseObserver && mouseObserver.isRunning()) mouseObserver.stop();
+  if (win && !win.isDestroyed()) win.hide();
+});
+// Renderer → main: the actual visible overlay blocks (DIP, relative to the
+// window's content area). Used by the observer as the INSIDE/OUTSIDE boundary
+// so clicks outside the visible Cue answer overlay dismiss Cue even when they
+// still land inside the larger transparent BrowserWindow. `null`/missing → the
+// observer falls back to the whole window bounds.
+ipcMain.on('window:outside-region', (_e, r) => {
+  const rects = (r && Array.isArray(r.rects))
+    ? r.rects.filter((q) => q && q.width > 0 && q.height > 0).map((q) => ({ x: q.x, y: q.y, width: q.width, height: q.height }))
+    : [];
+  outsideRegion = rects.length ? { rects } : null;
+});
 ipcMain.handle('window:getSize', () => { if (win && !win.isDestroyed()) return win.getSize(); return [700, 600]; });
 ipcMain.handle('window:setSize', (_e, w, h) => { if (win && !win.isDestroyed()) win.setSize(w, h); });
 ipcMain.on('window:setBounds', (_e, bounds) => {

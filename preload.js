@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('cue', {
   getWindowSize: () => ipcRenderer.invoke('window:getSize'),
   setWindowSize: (w, h) => ipcRenderer.invoke('window:setSize', w, h),
   setBounds: (b) => ipcRenderer.send('window:setBounds', b),
+  setOutsideRegion: (r) => ipcRenderer.send('window:outside-region', r),
   setPosition: (pos) => ipcRenderer.send('window:setPosition', pos),
   dragStart: () => ipcRenderer.send('window:drag-start'),
   moveWindow: (pos) => ipcRenderer.send('window:move', pos),
